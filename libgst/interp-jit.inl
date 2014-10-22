@@ -179,6 +179,7 @@ lookup_native_ip (OOP sendSelector,
 		  OOP method_class) /* the class in which to start the
 				       search */
 {
+  method_entry *entry;
   REGISTER (1, int hashIndex);
   REGISTER (2, method_cache_entry * methodData);
   REGISTER (3, OOP receiverClass);
@@ -207,12 +208,15 @@ lookup_native_ip (OOP sendSelector,
 
   receiverClass = OOP_INT_CLASS (receiver);
   if (methodData->receiverClass == receiverClass)
-    return (methodData->nativeCode);
+  {
+    entry = methodData->methodEntry;
+    return (entry->nativeCode);
+  }
 
   methodData->receiverClass = receiverClass;
-  methodData->nativeCode =
-    _gst_get_native_code (methodData->methodOOP, receiverClass);
-  return (methodData->nativeCode);
+  methodData->methodEntry = entry =
+    _gst_get_method_entry (methodData->methodOOP, receiverClass);
+  return (entry->nativeCode);
 }
 
 void
@@ -224,6 +228,7 @@ _gst_send_message_internal (OOP sendSelector,
 {
   int hashIndex;
   method_header header;
+  method_entry *entry;
   REGISTER (1, OOP receiverClass);
   REGISTER (2, method_cache_entry * methodData);
 
@@ -258,10 +263,11 @@ _gst_send_message_internal (OOP sendSelector,
   if (methodData->receiverClass != receiverClass)
     {
       methodData->receiverClass = receiverClass;
-      methodData->nativeCode =
-	_gst_get_native_code (methodData->methodOOP, receiverClass);
+      methodData->methodEntry =
+	_gst_get_method_entry (methodData->methodOOP, receiverClass);
     }
-  native_ip = methodData->nativeCode;
+  entry = methodData->methodEntry;
+  native_ip = entry->nativeCode;
 }
 
 
@@ -270,6 +276,7 @@ _gst_send_method (OOP methodOOP)
 {
   OOP receiverClass;
   method_header header;
+  method_entry *entry;
   REGISTER (1, gst_compiled_method method);
   REGISTER (2, OOP receiver);
   REGISTER (3, int sendArgs);
@@ -282,7 +289,8 @@ _gst_send_method (OOP methodOOP)
   receiver = STACK_AT (sendArgs);
 
   receiverClass = OOP_INT_CLASS (receiver);
-  native_ip = _gst_get_native_code (methodOOP, receiverClass);
+  entry = _gst_get_method_entry (methodOOP, receiverClass);
+  native_ip = entry->nativeCode;
 }
 
 static mst_Boolean
@@ -291,6 +299,7 @@ send_block_value (int numArgs, int cull_up_to)
   OOP closureOOP;
   OOP receiverClass;
   block_header header;
+  method_entry *entry;
   REGISTER (2, gst_block_closure closure);
 
   closureOOP = STACK_AT (numArgs);
@@ -311,7 +320,8 @@ send_block_value (int numArgs, int cull_up_to)
     ? _gst_small_integer_class
     : OOP_CLASS (closure->receiver);
 
-  native_ip = _gst_get_native_code (closure->block, receiverClass);
+  entry = _gst_get_method_entry (closure->block, receiverClass);
+  native_ip = entry->nativeCode;
   return (false);
 }
 
@@ -321,10 +331,12 @@ _gst_validate_method_cache_entries (void)
 {
   int i;
   method_cache_entry *mc;
+  method_entry *entry;
   for (i = 0; i < METHOD_CACHE_SIZE; i++)
     {
       mc = &method_cache[i];
-      if (mc->selectorOOP && !IS_VALID_IP (mc->nativeCode))
+      entry = mc->methodEntry;
+      if (mc->selectorOOP && !entry->receiverClass)
 	/* invalidate this entry */
 	mc->selectorOOP = NULL;
     }

@@ -56,6 +56,9 @@
 
 #ifdef ENABLE_JIT_TRANSLATION
 
+#include "lightning.h"
+#include "jitpriv.h"
+
 struct inline_cache;
 struct ip_map;
 typedef struct method_entry
@@ -65,15 +68,16 @@ typedef struct method_entry
   OOP receiverClass;
   struct inline_cache *inlineCaches;
   struct ip_map *ipMap;
-  int nativeCode[1];		/* type chosen randomly */
+  void *nativeCode;
+  jit_state_t *_jit;
 }
 method_entry;
 
 extern void _gst_reset_inline_caches ()
   ATTRIBUTE_HIDDEN;
 
-extern PTR _gst_get_native_code (OOP methodOOP,
-				 OOP receiverClass) 
+extern PTR _gst_get_method_entry (OOP methodOOP,
+				  OOP receiverClass) 
   ATTRIBUTE_HIDDEN;
 
 extern PTR _gst_map_virtual_ip (OOP methodOOP,
@@ -95,12 +99,6 @@ extern PTR (*_gst_run_native_code) ()
 
 extern PTR (*_gst_return_from_native_code) ()
   ATTRIBUTE_HIDDEN;
-
-#define GET_METHOD_ENTRY(nativeCodeStart) ((method_entry *) (		\
-  ((char *) nativeCodeStart) - (sizeof(method_entry) - sizeof(int))  ))
-
-#define IS_VALID_IP(nativeCodeStart) 					\
-  ((nativeCodeStart) && GET_METHOD_ENTRY((nativeCodeStart))->receiverClass)
 
 #endif /* ENABLE_JIT_TRANSLATION */
 

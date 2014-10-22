@@ -134,7 +134,7 @@ typedef struct method_cache_entry
   method_header methodHeader;
 #ifdef ENABLE_JIT_TRANSLATION
   OOP receiverClass;
-  PTR nativeCode;
+  PTR methodEntry;
   PTR dummy;                    /* 32 bytes are usually a sweet spot */
 #endif
 } method_cache_entry;
@@ -318,7 +318,7 @@ extern unsigned long _gst_saved_bytecode_counter
    next executed bytecode (note: the global is usually synchronized at
    sequence points only).  */
 #ifdef ENABLE_JIT_TRANSLATION
-typedef int ip_type;
+typedef long ip_type;
 extern char *native_ip;
 #else /* plain bytecode interpreter */
 typedef gst_uchar *ip_type;
@@ -346,7 +346,7 @@ extern const char *_gst_abort_execution
 /* Set to true when some special action must be done at the next
    sequence point.  */
 #ifdef ENABLE_JIT_TRANSLATION
-extern mst_Boolean _gst_except_flag 
+extern int _gst_except_flag 
   ATTRIBUTE_HIDDEN;
 #endif
 

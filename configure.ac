@@ -639,6 +639,8 @@ enable_jit=no)
 
 LIGHTNING_CONFIGURE_IF_NOT_FOUND([], enable_jit=no)
 if test "$enable_jit" != no; then
+  AC_CHECK_LIB(lightning, init_jit, ,
+    [AC_MSG_ERROR([GNU lightning not found, see http://www.gnu.org/software/lightning/])])
   AC_DEFINE(ENABLE_JIT_TRANSLATION, 1, 
     [Define to enable dynamic translation to machine code])
 fi

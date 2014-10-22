@@ -54,15 +54,6 @@
 #include "match.h"
 
 #ifdef ENABLE_JIT_TRANSLATION
-#include "lightning.h"
-#include "jitpriv.h"
-
-#ifdef __GNUC__
-#warning .---------------------------------------
-#warning | do not worry if you get lots of
-#warning | 'value computed is not used' warnings
-#warning `---------------------------------------
-#endif
 
 /* This file implements GNU Smalltalk's just-in-time compiler to native code.
    It is inspired by techniques shown in Ian Piumarta's PhD thesis "Delayed
@@ -85,24 +76,6 @@
    interp.c, not to the compiler.  */
 
 
-/* These two small structures are used to store information on labels
-   and forward references.  */
-typedef struct label_use
-{
-  jit_insn *addr;		/* addr of client insn */
-  struct label_use *next;	/* next label use or 0 */
-}
-label_use;
-
-typedef struct label
-{
-  jit_insn *addr;		/* defined address of label or 0
-				   (forward) */
-  label_use *uses;		/* list of uses while forward */
-}
-label;
-
-
 /* This structure represents an n-tree. Children of a node are
    connected by a linked list. It is probably the most important for
    the operation of the translator.
@@ -123,7 +96,7 @@ typedef struct code_tree
   struct code_tree *child, *next;
   int operation;
   PTR data;
-  label *jumpDest;
+  jit_node_t *jumpDest;
   gst_uchar *bp;
   unsigned char bc_len;		/* only used for sends */
 } code_tree, *code_stack_element, **code_stack_pointer;
@@ -143,8 +116,8 @@ typedef struct code_tree
 typedef struct inline_cache
 {
   OOP selector;
-  jit_insn *cachedIP;
-  jit_insn *native_ip;
+  void *cachedIP;
+  void *native_ip;
   char imm;			/* For short sends, the selector number. */
   char numArgs;
   char more;
@@ -154,7 +127,7 @@ inline_cache;
 
 typedef struct ip_map
 {
-  jit_insn *native_ip;
+  void *native_ip;
   int virtualIP;
 }
 ip_map;
@@ -166,9 +139,9 @@ ip_map;
 typedef struct deferred_send
 {
   code_tree *tree;
-  label *trueDest;
-  label *falseDest;
-  label *address;
+  jit_node_t *trueDest;
+  jit_node_t *falseDest;
+  jit_node_t *address;
   int reg0, reg1;
   OOP oop;
   struct deferred_send *next;
@@ -176,18 +149,20 @@ typedef struct deferred_send
 deferred_send;
 
 
+/* Lighting */
+static jit_state_t *global_jit, *_jit;
+static jit_node_t **map_patch;
+static ip_map *buf_patch;
+static size_t num_map_patch, size_map_patch;
+static size_t num_buf_patch, size_buf_patch;
+
 /* To reduce multiplies and divides to shifts */
 
 #define LONG_SHIFT (sizeof (long) == 4 ? 2 : 3)
 
-/* An arbitrary value */
-
-#define MAX_BYTES_PER_BYTECODE	(100 * sizeof(jit_insn))
-
 /* These are for the hash table of translations */
 
 #define HASH_TABLE_SIZE		(8192)
-#define METHOD_HEADER_SIZE 	(sizeof(method_entry) - sizeof(jit_insn))
 
 /* Here is where the dynamically compiled stuff goes */
 static method_entry *methods_table[HASH_TABLE_SIZE+1], *released;
@@ -199,7 +174,7 @@ static method_entry *current;
 static struct obstack aux_data_obstack;
 static inline_cache *curr_inline_cache;
 static deferred_send *deferred_head;
-static label **labels, **this_label;
+static jit_node_t **labels, **this_label;
 static gst_uchar *bc;
 static OOP *literals;
 static OOP method_class;
@@ -211,8 +186,14 @@ static mst_Boolean self_cached, rec_var_cached;
 static int sp_delta, self_class_check, stack_cached;
 
 /* These are pieces of native code that are used by the run-time.  */
-static jit_insn *do_send_code, *do_super_code, *non_boolean_code,
+static void *do_send_code, *do_super_code, *non_boolean_code,
   *bad_return_code, *does_not_understand_code;
+static jit_node_t *native_code_label;
+#if 1
+char method_name[64];
+#define	jit_field(struc, f)		( ((long) (&((struc *) 8)->f) ) - 8)
+#define	jit_ptr_field(struc_p, f)	( ((long) (&((struc_p) 8)->f) ) - 8)
+#endif
 
 PTR (*_gst_run_native_code) ();
 PTR (*_gst_return_from_native_code) ();
@@ -297,22 +278,23 @@ typedef mst_Boolean (*decode_func) (gst_uchar b, gst_uchar *bp);
 static inline int analyze_factor (int x);
 static inline void analyze_dividend (int imm, int *shift, mst_Boolean *adjust, uintptr_t *factor);
 
+/* address translation */
+static inline void defer_map_patch (void **label);
+static inline void defer_buf_patch (size_t offset);
+static void flush_patches (char *buf);
+
 /* label handling */
-static inline label *lbl_new (void);
-static inline jit_insn *lbl_get (label *lbl);
-static inline void lbl_use (label *lbl, jit_insn *result);
-static inline mst_Boolean lbl_define (label *lbl);
 static inline void define_ip_map_entry (int virtualIP);
 
 /* Inlining (deferred sends) */
-static void defer_send (code_tree *tree, mst_Boolean isBool, jit_insn *address, int reg0, int reg1, OOP oop);
-static inline label *last_deferred_send (void);
+static void defer_send (code_tree *tree, mst_Boolean isBool, jit_node_t *jump, int reg0, int reg1, OOP oop);
+static inline jit_node_t *last_deferred_send (void);
 static inline void emit_deferred_sends (deferred_send *ds);
 static inline void finish_deferred_send (void);
 
 /* CompiledMethod hash table handling */
 static method_entry *find_method_entry (OOP methodOOP, OOP receiverClass);
-static inline void new_method_entry (OOP methodOOP, OOP receiverClass, int size);
+static inline void new_method_entry (OOP methodOOP, OOP receiverClass);
 static inline method_entry *finish_method_entry (void);
 
 /* code_tree handling */
@@ -427,26 +409,7 @@ static const int special_send_bytecodes[32] = {
 };
 
 
-
 /* Runtime support code */
-
-static void
-generate_run_native_code (void)
-{
-  static inline_cache ic;
-  static int arg;
-
-  jit_prolog (1);
-  arg = jit_arg_p ();
-  jit_getarg_p (JIT_R0, arg);
-  jit_movi_p (JIT_V1, &ic);
-  jit_ldi_p (JIT_V2, &sp);
-  jit_jmpr (JIT_R0);
-  jit_align (2);
-
-  ic.native_ip = jit_get_label ();
-  jit_ret ();
-}
 
 static void
 generate_dnu_code (void)
@@ -456,16 +419,16 @@ generate_dnu_code (void)
      lookup_native_ip; no inline caching must take place because we
      have modify the stack each time they try to send the message.  */
 
-  jit_ldi_p (JIT_V2, &sp);	/* changed by lookup_method!! */
-  jit_movi_l (JIT_R2, 1);
-  jit_ldi_p (JIT_R0, &_gst_does_not_understand_symbol);
-  jit_ldxi_p (JIT_R1, JIT_V2, -sizeof (PTR));
-  jit_prepare (4);
-  jit_pusharg_p (JIT_V0);	/* method_class */
-  jit_pusharg_p (JIT_R1);	/* receiver */
-  jit_pusharg_i (JIT_R2);	/* numArgs */
-  jit_pusharg_p (JIT_R0);	/* selector */
-  jit_finish (PTR_LOOKUP_NATIVE_IP);
+  jit_ldi (JIT_V2, &sp);	/* changed by lookup_method!! */
+  jit_movi (JIT_R2, 1);
+  jit_ldi (JIT_R0, &_gst_does_not_understand_symbol);
+  jit_ldxi (JIT_R1, JIT_V2, -(int)sizeof (PTR));
+  jit_prepare ();
+  jit_pushargr (JIT_R0);	/* selector */
+  jit_pushargr (JIT_R2);	/* numArgs */
+  jit_pushargr (JIT_R1);	/* receiver */
+  jit_pushargr (JIT_V0);	/* method_class */
+  jit_finishi (PTR_LOOKUP_NATIVE_IP);
   jit_retval (JIT_R0);
 
   /* Could crash if again #doesNotUnderstand: -- probably better than
@@ -474,32 +437,39 @@ generate_dnu_code (void)
 }
 
 static void
-generate_bad_return_code (void)
+generate_bad_return_code (jit_node_t *does_not_understand_label)
 {
-  jit_insn *jmp;
+  jit_node_t *jmp;
 
-  jit_ldi_p (JIT_V2, &sp);
-  jit_movi_l (JIT_R2, 0);
-  jit_ldi_p (JIT_R0, &_gst_bad_return_error_symbol);
-  jit_ldr_p (JIT_R1, JIT_V2);
+  jit_ldi (JIT_V2, &sp);
+  jit_movi (JIT_R2, 0);
+  jit_ldi (JIT_R0, &_gst_bad_return_error_symbol);
+  jit_ldr (JIT_R1, JIT_V2);
 
   /* load the class of the receiver (which is in R1) */
-  jit_movi_p (JIT_V0, _gst_small_integer_class);
-  jmp = jit_bmsi_l (jit_forward (), JIT_R1, 1);
-  jit_ldxi_p (JIT_V0, JIT_R1, jit_ptr_field (OOP, object));
-  jit_ldxi_p (JIT_V0, JIT_V0, jit_ptr_field (gst_object, objClass));
+  jit_movi (JIT_V0, (jit_word_t)_gst_small_integer_class);
+  jmp = jit_bmsi (JIT_R1, 1);
+  jit_ldxi (JIT_V0, JIT_R1, offsetof (struct oop_s, object));
+  jit_ldxi (JIT_V0, JIT_V0, offsetof (struct object_s, objClass));
+#if 1
+  jit_note("badReturn", __LINE__);
+#endif
   jit_patch (jmp);
 
-  jit_prepare (4);
-  jit_pusharg_p (JIT_V0);	/* method_class */
-  jit_pusharg_p (JIT_R1);	/* receiver */
-  jit_pusharg_i (JIT_R2);	/* numArgs */
-  jit_pusharg_p (JIT_R0);	/* selector */
-  jit_finish (PTR_LOOKUP_NATIVE_IP);
+  jit_prepare ();
+  jit_pushargr (JIT_R0);	/* selector */
+  jit_pushargr (JIT_R2);	/* numArgs */
+  jit_pushargr (JIT_R1);	/* receiver */
+  jit_pushargr (JIT_V0);	/* method_class */
+  jit_finishi (PTR_LOOKUP_NATIVE_IP);
   jit_retval (JIT_R0);
 
   /* Might not be understood... how broken they are :-) */
-  jit_beqi_l (does_not_understand_code, JIT_R0, 0);
+  jmp = jit_beqi (JIT_R0, 0);
+  jit_patch_at (jmp, does_not_understand_label);
+#if 1
+  jit_note("badReturn", __LINE__);
+#endif
   jit_jmpr (JIT_R0);
 }
 
@@ -508,173 +478,254 @@ generate_non_boolean_code (void)
 {
   static char methodName[] = "mustBeBoolean";
 
-  jit_ldi_p (JIT_V2, &sp);	/* push R0 on the */
-  jit_stxi_p (sizeof (PTR), JIT_V2, JIT_R0);	/* Smalltalk stack */
-  jit_addi_p (JIT_V2, JIT_V2, sizeof (PTR));
-  jit_movi_p (JIT_R1, methodName);
-  jit_sti_p (&sp, JIT_V2);	/* update SP */
-  jit_sti_p (&_gst_abort_execution, JIT_R1);
+  jit_ldi (JIT_V2, &sp);	/* push R0 on the */
+  jit_stxi (sizeof (PTR), JIT_V2, JIT_R0);	/* Smalltalk stack */
+  jit_addi (JIT_V2, JIT_V2, sizeof (PTR));
+  jit_movi (JIT_R1, (jit_word_t)methodName);
+  jit_sti (&sp, JIT_V2);	/* update SP */
+  jit_sti (&_gst_abort_execution, JIT_R1);
   jit_ret ();
 }
 
 static void
-generate_do_super_code (void)
+generate_do_super_code (jit_node_t *does_not_understand_label)
 {
-  /* load other args into R1/R2 */
-  jit_ldi_l (JIT_R1, &_gst_self);
-  jit_ldxi_uc (JIT_R2, JIT_V1, jit_field (inline_cache, numArgs));
-  jit_ldxi_p (JIT_R0, JIT_V1, jit_field (inline_cache, selector));
+  jit_node_t *jmp;
 
-  jit_prepare (4);
-  jit_pusharg_p (JIT_V0);	/* method_class */
-  jit_pusharg_p (JIT_R1);	/* receiver */
-  jit_pusharg_i (JIT_R2);	/* numArgs */
-  jit_pusharg_p (JIT_R0);	/* selector */
-  jit_finish (PTR_LOOKUP_NATIVE_IP);
+  /* load other args into R1/R2 */
+  jit_ldi (JIT_R1, &_gst_self);
+  jit_ldxi_uc (JIT_R2, JIT_V1, offsetof (inline_cache, numArgs));
+  jit_ldxi (JIT_R0, JIT_V1, offsetof (inline_cache, selector));
+
+  jit_prepare ();
+  jit_pushargr (JIT_R0);	/* selector */
+  jit_pushargr (JIT_R2);	/* numArgs */
+  jit_pushargr (JIT_R1);	/* receiver */
+  jit_pushargr (JIT_V0);	/* method_class */
+  jit_finishi (PTR_LOOKUP_NATIVE_IP);
   jit_retval (JIT_R0);
 
   /* store the address in the inline cache if not #doesNotUnderstand: */
-  jit_beqi_l (does_not_understand_code, JIT_R0, 0);
-  jit_stxi_p (jit_field (inline_cache, cachedIP), JIT_V1, JIT_R0);
+  jmp = jit_beqi (JIT_R0, 0);
+  jit_patch_at (jmp, does_not_understand_label);
+  jit_stxi (offsetof (inline_cache, cachedIP), JIT_V1, JIT_R0);
+#if 1
+  jit_note("doSuper", __LINE__);
+#endif
   jit_jmpr (JIT_R0);
 }
 
 static void
-generate_do_send_code (void)
+generate_do_send_code (jit_node_t *does_not_understand_label)
 {
-  jit_insn *jmp;
+  jit_node_t *jmp;
 
   /* load other parameters into R0/R2 */
-  jit_ldxi_uc (JIT_R2, JIT_V1, jit_field (inline_cache, numArgs));
-  jit_ldxi_p (JIT_R0, JIT_V1, jit_field (inline_cache, selector));
+  jit_ldxi_uc (JIT_R2, JIT_V1, offsetof (inline_cache, numArgs));
+  jit_ldxi (JIT_R0, JIT_V1, offsetof (inline_cache, selector));
 
   /* load _gst_self into R1 */
-  jit_lshi_l (JIT_R1, JIT_R2, LONG_SHIFT);
-  jit_negr_l (JIT_R1, JIT_R1);
-  jit_ldxr_l (JIT_R1, JIT_V2, JIT_R1);
+  jit_lshi (JIT_R1, JIT_R2, LONG_SHIFT);
+  jit_negr (JIT_R1, JIT_R1);
+  jit_ldxr (JIT_R1, JIT_V2, JIT_R1);
 
   /* method class */
-  jit_movi_p (JIT_V0, _gst_small_integer_class);
-  jmp = jit_bmsi_l (jit_forward (), JIT_R1, 1);
-  jit_ldxi_p (JIT_V0, JIT_R1, jit_ptr_field (OOP, object));
-  jit_ldxi_p (JIT_V0, JIT_V0, jit_ptr_field (gst_object, objClass));
+  jit_movi (JIT_V0, (jit_word_t)_gst_small_integer_class);
+  jmp = jit_bmsi (JIT_R1, 1);
+  jit_ldxi (JIT_V0, JIT_R1, offsetof (struct oop_s, object));
+  jit_ldxi (JIT_V0, JIT_V0, offsetof (struct object_s, objClass));
+#if 1
+  jit_note("doSend", __LINE__);
+#endif
   jit_patch (jmp);
 
-  jit_prepare (4);
-  jit_pusharg_p (JIT_V0);	/* method_class */
-  jit_pusharg_p (JIT_R1);	/* receiver */
-  jit_pusharg_i (JIT_R2);	/* numArgs */
-  jit_pusharg_p (JIT_R0);	/* selector */
-  jit_finish (PTR_LOOKUP_NATIVE_IP);
+  jit_prepare ();
+  jit_pushargr (JIT_R0);	/* selector */
+  jit_pushargr (JIT_R2);	/* numArgs */
+  jit_pushargr (JIT_R1);	/* receiver */
+  jit_pushargr (JIT_V0);	/* method_class */
+  jit_finishi (PTR_LOOKUP_NATIVE_IP);
   jit_retval (JIT_R0);
 
   /* store the address in the inline cache if not #doesNotUnderstand: */
-  jit_beqi_l (does_not_understand_code, JIT_R0, 0);
-  jit_stxi_p (jit_field (inline_cache, cachedIP), JIT_V1, JIT_R0);
+  jmp = jit_beqi (JIT_R0, 0);
+  jit_patch_at (jmp, does_not_understand_label);
+  jit_stxi (offsetof (inline_cache, cachedIP), JIT_V1, JIT_R0);
+#if 1
+  jit_note("doSend", __LINE__);
+#endif
   jit_jmpr (JIT_R0);
 }
 
 void
 generate_run_time_code (void)
 {
-  PTR area = xmalloc (10000);
+  static inline_cache ic;
+  jit_node_t *arg;
+  jit_node_t *does_not_understand_label;
+  jit_node_t *bad_return_label;
+  jit_node_t *non_boolean_label;
+  jit_node_t *do_super_label;
+  jit_node_t *do_send_label;
+  jit_node_t *return_zero_from_native_label;
+  jit_node_t *return_from_native_label;
 
-  _gst_run_native_code = jit_set_ip (area).pptr;
-  generate_run_native_code ();
+  size_map_patch = 16;
+  map_patch = (jit_node_t **) xmalloc (sizeof (jit_node_t *) * size_map_patch);
+  num_map_patch = 0;
 
-  jit_align (2);
-  does_not_understand_code = jit_get_label ();
-  jit_prolog (1);
-  jit_set_ip (does_not_understand_code);
+  size_buf_patch = 16;
+  buf_patch = (ip_map *) xmalloc (sizeof (ip_map) * size_buf_patch);
+  num_buf_patch = 0;
+
+#if 0
+  init_jit (NULL);
+#else
+  init_jit ("/home/pcpa/gnu/smalltalk/.libs/gst");
+#endif
+  _jit = global_jit = jit_new_state();
+
+#if 1
+  jit_note("runNative", __LINE__);
+#endif
+  jit_prolog ();
+  jit_frame (256);
+  arg = jit_arg ();
+  jit_getarg (JIT_R0, arg);
+  jit_movi (JIT_V1, (jit_word_t)&ic);
+  jit_ldi (JIT_V2, &sp);
+  jit_jmpr (JIT_R0);
+
+#if 1
+  jit_note("doesNotUnderstand", __LINE__);
+#endif
+  does_not_understand_label = jit_indirect ();
   generate_dnu_code ();
 
   /* send #badReturnError.  No inline caching must take place because
      this is called upon a return, not upon a send.  */
-  jit_align (2);
-  bad_return_code = jit_get_label ();
-  jit_prolog (1);
-  jit_set_ip (bad_return_code);
-  generate_bad_return_code ();
+#if 1
+  jit_note("badReturn", __LINE__);
+#endif
+  bad_return_label = jit_indirect ();
+  generate_bad_return_code (does_not_understand_label);
 
-  jit_align (2);
-  non_boolean_code = jit_get_label ();
-  jit_prolog (1);
-  jit_set_ip (non_boolean_code);
+#if 1
+  jit_note("nonBoolean", __LINE__);
+#endif
+  non_boolean_label = jit_indirect ();
   generate_non_boolean_code ();
 
-  jit_align (2);
-  do_super_code = jit_get_label ();
-  jit_prolog (1);
-  jit_set_ip (do_super_code);
-  generate_do_super_code ();
+#if 1
+  jit_note("doSuper", __LINE__);
+#endif
+  do_super_label = jit_indirect ();
+  generate_do_super_code (does_not_understand_label);
 
-  jit_align (2);
-  do_send_code = jit_get_label ();
-  jit_prolog (1);
-  jit_set_ip (do_send_code);
-  generate_do_send_code ();
+#if 1
+  jit_note("doSend", __LINE__);
+#endif
+  do_send_label = jit_indirect ();
+  generate_do_send_code (does_not_understand_label);
 
-  jit_align (2);
-  _gst_return_from_native_code = jit_get_ip ().pptr;
-  jit_prolog (1);
-  jit_set_ip ((void *) _gst_return_from_native_code);
+#if 1
+  jit_note("returnZeroFromNative", __LINE__);
+#endif
+  return_zero_from_native_label = jit_indirect ();
+  jit_movi (JIT_R0, 0);
+#if 1
+  jit_note("returnFromNative", __LINE__);
+#endif
+  return_from_native_label = jit_indirect ();
+  jit_retr (JIT_R0);
 
-  jit_movi_i (JIT_RET, 0);
-  jit_ret ();
+  jit_realize ();
+#if 0
+  jit_set_data (NULL, 0, JIT_DISABLE_DATA|JIT_DISABLE_NOTE);
+#endif
+  _gst_run_native_code = jit_emit ();
 
-  jit_flush_code(_gst_run_native_code, jit_get_label() );
+  does_not_understand_code = jit_address (does_not_understand_label);
+  bad_return_code = jit_address (bad_return_label);
+  non_boolean_code = jit_address (non_boolean_label);
+  do_send_code = jit_address (do_send_label);
+  do_super_code = jit_address (do_super_label);
+  non_boolean_code = jit_address (non_boolean_label);
+  bad_return_code = jit_address (bad_return_label);
+  does_not_understand_code = jit_address (does_not_understand_label);
+  _gst_return_from_native_code = jit_address (return_from_native_label);
+  ic.native_ip = jit_address (return_zero_from_native_label);
+
+#if 1
+  printf ("<main>\n");
+  jit_disassemble ();
+#endif
+  jit_clear_state ();
 }
 
 
 /* Functions for managing the translated methods' hash table */
 
 void
-new_method_entry (OOP methodOOP, OOP receiverClass, int size)
+new_method_entry (OOP methodOOP, OOP receiverClass)
 {
-  if (!size)
-    size = GET_METHOD_NUM_ARGS (methodOOP) * 2 + 10;
-
-  current =
-    (method_entry *) xmalloc (MAX_BYTES_PER_BYTECODE * (size + 2));
+  current = (method_entry *) xmalloc (sizeof (method_entry));
   current->methodOOP = methodOOP;
   current->receiverClass = receiverClass;
   current->inlineCaches = NULL;
   methodOOP->flags |= F_XLAT;
 
+#if 1
+  printf ("<methodOOP: ");
+  _gst_print_object (methodOOP);
+  printf (">\n<receiverClass: ");
+  _gst_print_object (receiverClass);
+  printf (">\n");
+  sprintf (method_name, "%lx", methodOOP);
+#endif
+
   /* The buffer functions in str.c are used to deal with the ip_map.  */
   _gst_reset_buffer ();
 
   obstack_init (&aux_data_obstack);
-  jit_set_ip (current->nativeCode);
+  current->_jit = _jit = jit_new_state ();
 
-  /* We need to compile a dummy prolog, which we'll overwrite, to make
-     GNU lightning's status consistent with that when the
-     trampolineCode was written.  */
-  jit_prolog (1);
-  jit_set_ip (current->nativeCode);
+  /* Create code in trampoline format that GNU lightning understands. */
+  native_code_label = jit_label ();
+  jit_prolog ();
+  jit_tramp (256);
 }
 
 method_entry *
 finish_method_entry (void)
 {
   unsigned int hashEntry;
-  char *codePtr;
   method_entry *result;
   int size;
 
-  /* Shrink the method, and store it into the hash table */
-  codePtr = (char *) jit_get_label ();
-  jit_flush_code (current->nativeCode, codePtr);
+  /* Close the trampoline associated with the method entry. */
+  jit_epilog ();
 
-  result =
-    (method_entry *) xrealloc (current, codePtr - (char *) current);
+  result = current;
   current = NULL;
 
   /* Copy the IP map, adding a final dummy entry */
   define_ip_map_entry (-1);
+  jit_realize ();
+#if 0
+  jit_set_data (NULL, 0, JIT_DISABLE_DATA|JIT_DISABLE_NOTE);
+#endif
+  result->nativeCode = jit_emit ();
   size = _gst_buffer_size ();
   result->ipMap = (ip_map *) xmalloc (size);
   _gst_copy_buffer (result->ipMap);
+  flush_patches ((char *)result->ipMap);
+  //
+#if 1
+  jit_disassemble ();
+#endif
+  //
+  jit_clear_state ();
 
   hashEntry = OOP_INDEX (result->methodOOP) % HASH_TABLE_SIZE;
   result->next = methods_table[hashEntry];
@@ -894,72 +945,45 @@ analyze_dividend (int imm, int *shift, mst_Boolean *adjust, uintptr_t *factor)
 
 
 /* Functions for managing labels and forward references */
-
-label *
-lbl_new (void)
+void
+defer_map_patch (void **label)
 {
-  label *lbl = obstack_alloc (&aux_data_obstack, sizeof (label));
-  lbl->addr = NULL;
-  lbl->uses = NULL;
-#ifdef DEBUG_LABELS
-  printf ("Defined reference at %p\n", lbl);
-#endif
-  return lbl;
-}
-
-jit_insn *
-lbl_get (label *lbl)
-{
-  return lbl->addr ? lbl->addr : jit_forward ();
+  if (num_map_patch + 1 >= size_map_patch)
+    {
+      size_map_patch += 16;
+      map_patch = (jit_node_t **) xrealloc (map_patch, size_map_patch
+					    * sizeof (jit_node_t *));
+    }
+  map_patch[num_map_patch++] = (jit_node_t *)label;
+  *label = jit_indirect ();
 }
 
 void
-lbl_use (label *lbl, jit_insn *result)
+defer_buf_patch (size_t offset)
 {
-  if (!lbl->addr)
+  if (num_buf_patch + 1 >= size_buf_patch)
     {
-      /* forward reference */
-      label_use *use =
-	obstack_alloc (&aux_data_obstack, sizeof (label_use));
-#ifdef DEBUG_LABELS
-      printf ("Forward reference at %p to %p (next = %p)\n", 
-	      result, lbl, lbl->uses);
-#endif
-      use->addr = result;
-      use->next = lbl->uses;
-      lbl->uses = use;
+      size_buf_patch += 16;
+      buf_patch = (ip_map *) xrealloc (buf_patch, size_buf_patch
+				       * sizeof (ip_map));
     }
-#ifdef DEBUG_LABELS
-  else
-    printf ("Backward reference at %p to %p (%p)\n", result,
-	    lbl->addr, lbl);
-#endif
+  buf_patch[num_buf_patch].native_ip = jit_indirect ();
+  buf_patch[num_buf_patch].virtualIP = offset;
+  ++num_buf_patch;
 }
 
-mst_Boolean
-lbl_define (label *lbl)
+void
+flush_patches (char *buf)
 {
-  label_use *use = lbl->uses;
-  mst_Boolean used;
+  size_t i;
+  for (i = 0; i < num_map_patch; ++i)
+    *(void **)map_patch[i] = jit_address(*(void **)map_patch[i]);
+  num_map_patch = 0;
 
-  jit_align (2);
-  lbl->addr = jit_get_label ();
-  used = (use != NULL);
-
-#ifdef DEBUG_LABELS
-  printf ("Defined label at %p (%p)\n", lbl->addr, lbl);
-#endif
-  while (use)
-    {
-      label_use *next = use->next;
-#ifdef DEBUG_LABELS
-      printf ("Resolving forward reference at %p\n", use->addr);
-#endif
-      jit_patch (use->addr);
-      use = next;
-    }
-
-  return (used);
+  for (i = 0; i < num_buf_patch; ++i)
+    *(void **)(buf + buf_patch[i].virtualIP) =
+      jit_address (buf_patch[i].native_ip);
+  num_buf_patch = 0;
 }
 
 void
@@ -967,7 +991,7 @@ define_ip_map_entry (int virtualIP)
 {
   ip_map mapEntry;
   mapEntry.virtualIP = virtualIP;
-  mapEntry.native_ip = jit_get_label ();
+  defer_buf_patch (_gst_buffer_size ());
 
   _gst_add_buf_data (&mapEntry, sizeof (mapEntry));
 }
@@ -977,27 +1001,23 @@ finish_deferred_send (void)
 {
   if (!deferred_head->trueDest)
     {
-      deferred_head->trueDest = lbl_new ();
-      lbl_define (deferred_head->trueDest);
+      deferred_head->trueDest = jit_label ();
       if (!deferred_head->falseDest)
 	deferred_head->falseDest = deferred_head->trueDest;
     }
 
   else if (!deferred_head->falseDest)
-    {
-      deferred_head->falseDest = lbl_new ();
-      lbl_define (deferred_head->falseDest);
-    }
+    deferred_head->falseDest = jit_label ();
 }
 
-label *
+jit_node_t *
 last_deferred_send (void)
 {
   return deferred_head->address;
 }
 
 void
-defer_send (code_tree *tree, mst_Boolean isBool, jit_insn *address, int reg0, int reg1, OOP oop)
+defer_send (code_tree *tree, mst_Boolean isBool, jit_node_t *jump, int reg0, int reg1, OOP oop)
 {
   deferred_send *ds =
     obstack_alloc (&aux_data_obstack, sizeof (deferred_send));
@@ -1020,10 +1040,10 @@ defer_send (code_tree *tree, mst_Boolean isBool, jit_insn *address, int reg0, in
   ds->reg0 = reg0;
   ds->reg1 = reg1;
   ds->oop = oop;
-  ds->address = lbl_new ();
+  ds->address = jit_forward ();
 
-  if (address)
-    lbl_use (ds->address, address);
+  if (jump)
+    jit_patch_at (jump, ds->address);
 
   if (isBool)
     {
@@ -1061,7 +1081,7 @@ defer_send (code_tree *tree, mst_Boolean isBool, jit_insn *address, int reg0, in
 #define BEFORE_PUSH(reg) do {						\
   sp_delta += sizeof (PTR);						\
   if (sp_delta > 0) {							\
-    jit_stxi_p(sp_delta, JIT_V2, (reg));				\
+    jit_stxi(sp_delta, JIT_V2, (reg));					\
   }									\
 } while(0)
 
@@ -1074,7 +1094,7 @@ defer_send (code_tree *tree, mst_Boolean isBool, jit_insn *address, int reg0, in
     emit_code_tree(tree->child);					\
   }									\
   if (sp_delta < 0) {							\
-    jit_subi_p(JIT_V2, JIT_V2, sizeof (PTR));	/* pop stack top */	\
+    jit_subi(JIT_V2, JIT_V2, sizeof (PTR));	/* pop stack top */	\
     sp_delta += sizeof (PTR);						\
   }									\
 } while(0)
@@ -1084,8 +1104,8 @@ defer_send (code_tree *tree, mst_Boolean isBool, jit_insn *address, int reg0, in
 #define BEFORE_STORE do {						\
   emit_code_tree(tree->child);						\
   if (sp_delta < 0) {							\
-    jit_ldr_p(JIT_V0, JIT_V2);						\
-    jit_subi_p(JIT_V2, JIT_V2, sizeof (PTR));	/* pop stack top */	\
+    jit_ldr(JIT_V0, JIT_V2);						\
+    jit_subi(JIT_V2, JIT_V2, sizeof (PTR));	/* pop stack top */	\
     sp_delta += sizeof (PTR);						\
   }									\
 } while(0)
@@ -1094,19 +1114,19 @@ defer_send (code_tree *tree, mst_Boolean isBool, jit_insn *address, int reg0, in
 /* Common pieces of code for generating & caching addresses */
 
 #define TEMP_OFS(tree)	   (sizeof (PTR) * (((intptr_t) ((tree)->data)) & 255))
-#define REC_VAR_OFS(tree)  jit_ptr_field(gst_object, data[(intptr_t) ((tree)->data)])
-#define STACK_OFS(tree)	   (jit_ptr_field(gst_block_context, contextStack) + \
+#define REC_VAR_OFS(tree)  offsetof(struct object_s, data[(intptr_t) ((tree)->data)])
+#define STACK_OFS(tree)	   (offsetof(struct gst_block_context, contextStack) + \
 				TEMP_OFS (tree))
 
 
 /* Cache the address of the first instance variable in R1 */
-#define CACHE_REC_VAR do {					\
-  if (!rec_var_cached) {			/* in R1 */			\
+#define CACHE_REC_VAR do {						\
+  if (!rec_var_cached) {			/* in R1 */		\
     if (!self_cached) {			/* in V0 */			\
-      jit_ldi_p(JIT_R1, &_gst_self);						\
-      jit_ldxi_p(JIT_R1, JIT_R1, jit_ptr_field(OOP, object));		\
+      jit_ldi(JIT_R1, &_gst_self);					\
+      jit_ldxi(JIT_R1, JIT_R1, offsetof(struct oop_s, object));		\
     } else {								\
-      jit_ldxi_p(JIT_R1, JIT_V0, jit_ptr_field(OOP, object));		\
+      jit_ldxi(JIT_R1, JIT_V0, offsetof(struct oop_s, object));		\
     }									\
     rec_var_cached = true;						\
   }									\
@@ -1115,13 +1135,13 @@ defer_send (code_tree *tree, mst_Boolean isBool, jit_insn *address, int reg0, in
 /* Cache the address of the first temporary variable in V1 */
 #define CACHE_TEMP do {							\
   if (stack_cached != 0) {		/* in V1 */			\
-    jit_ldi_p(JIT_V1, &_gst_temporaries);					\
+    jit_ldi(JIT_V1, &_gst_temporaries);					\
     stack_cached = 0;							\
   }									\
 } while(0)
 
 #define CACHE_NOTHING do {						\
-  rec_var_cached = false;							\
+  rec_var_cached = false;						\
   stack_cached = -1;							\
   self_cached = false;							\
 } while(0)
@@ -1142,19 +1162,19 @@ defer_send (code_tree *tree, mst_Boolean isBool, jit_insn *address, int reg0, in
    because the VM provides the address of the first indexed instance
    variable for thisContext into the `_gst_temporaries' variable.  */
 #define CACHE_OUTER_CONTEXT do {					   \
-  int scopes;								   \
-  scopes = ((int) tree->data) >> 8;					   \
+  long scopes;								   \
+  scopes = ((long) tree->data) >> 8;					   \
   if (stack_cached <= 0 || stack_cached > scopes) {			   \
-    jit_ldi_p(JIT_V1, &_gst_this_context_oop);				   \
-    jit_ldxi_p(JIT_V1, JIT_V1, jit_ptr_field(OOP, object));		   \
+    jit_ldi(JIT_V1, &_gst_this_context_oop);				   \
+    jit_ldxi(JIT_V1, JIT_V1, offsetof(struct oop_s, object));		   \
     stack_cached = scopes;						   \
   } else {								   \
     scopes -= stack_cached;						   \
     stack_cached += scopes;						   \
   }									   \
   while (scopes--) {							   \
-    jit_ldxi_p(JIT_V1, JIT_V1, jit_ptr_field(gst_block_context, outerContext)); \
-    jit_ldxi_p(JIT_V1, JIT_V1, jit_ptr_field(OOP, object));		   \
+    jit_ldxi(JIT_V1, JIT_V1, offsetof(struct gst_block_context, outerContext)); \
+    jit_ldxi(JIT_V1, JIT_V1, offsetof(struct oop_s, object));		   \
   }									   \
 } while(0)
 
@@ -1174,15 +1194,15 @@ defer_send (code_tree *tree, mst_Boolean isBool, jit_insn *address, int reg0, in
 /* Remember that the stack top is cached in V0, and import V2 (the
  * stack pointer) from the sp variable.  */
 #define KEEP_V0_IMPORT_SP do {						\
-  jit_ldi_p(JIT_V2, &sp);						\
+  jit_ldi(JIT_V2, &sp);							\
   sp_delta = 0;								\
 } while(0)
 
 /* Remember that the stack top is *not* cached in V0, and import V2 (the
  * stack pointer) from the sp variable.  */
 #define IMPORT_SP do {							\
-  jit_ldi_p(JIT_V2, &sp);						\
-  sp_delta = -sizeof (PTR);						\
+  jit_ldi(JIT_V2, &sp);							\
+  sp_delta = -(int)sizeof (PTR);					\
 } while(0)
 
 /* Export V2 (the stack pointer) into the sp variable; the top of the
@@ -1190,10 +1210,10 @@ defer_send (code_tree *tree, mst_Boolean isBool, jit_insn *address, int reg0, in
 #define EXPORT_SP(reg) do {						\
   if (sp_delta >= 0) {							\
     sp_delta += sizeof (PTR);						\
-    jit_stxi_p(sp_delta, JIT_V2, (reg));				\
-    jit_addi_p(JIT_V2, JIT_V2, sp_delta);				\
-    jit_sti_p(&sp, JIT_V2);						\
-    sp_delta = -sizeof (PTR);						\
+    jit_stxi(sp_delta, JIT_V2, (reg));					\
+    jit_addi(JIT_V2, JIT_V2, sp_delta);					\
+    jit_sti(&sp, JIT_V2);						\
+    sp_delta = -(int)sizeof (PTR);					\
   }									\
 } while(0)
 
@@ -1201,7 +1221,7 @@ defer_send (code_tree *tree, mst_Boolean isBool, jit_insn *address, int reg0, in
  * stack is assured to be in *sp AND in V0.  */
 #define CACHE_STACK_TOP do {						\
   if (sp_delta < 0) {							\
-    jit_ldr_p(JIT_V0, JIT_V2);						\
+    jit_ldr(JIT_V0, JIT_V2);						\
   } else { 								\
     EXPORT_SP (JIT_V0);							\
   }									\
@@ -1211,44 +1231,44 @@ defer_send (code_tree *tree, mst_Boolean isBool, jit_insn *address, int reg0, in
  * the value cached in V0.  */
 #define KEEP_V0_EXPORT_SP do {						\
   if (sp_delta < 0) {							\
-    jit_ldr_p(JIT_V0, JIT_V2);						\
+    jit_ldr(JIT_V0, JIT_V2);						\
   }									\
   if (sp_delta != 0) {							\
-    jit_addi_p(JIT_V2, JIT_V2, sp_delta);				\
+    jit_addi(JIT_V2, JIT_V2, sp_delta);					\
   }									\
-  jit_sti_p(&sp, JIT_V2);						\
-  sp_delta = -sizeof (PTR);						\
+  jit_sti(&sp, JIT_V2);							\
+  sp_delta = -(int)sizeof (PTR);					\
 } while(0)
 
 /* Export V2 (the stack pointer) into the sp variable, without
  * saving the old stack top if it was cached in V0.  */
 #define POP_EXPORT_SP do {						\
   if (sp_delta) {							\
-    jit_addi_p(JIT_V2, JIT_V2, sp_delta);				\
+    jit_addi(JIT_V2, JIT_V2, sp_delta);					\
   }									\
-  jit_sti_p(&sp, JIT_V2);						\
-  jit_ldr_p(JIT_V0, JIT_V2);						\
-  sp_delta = -sizeof (PTR);						\
+  jit_sti(&sp, JIT_V2);							\
+  jit_ldr(JIT_V0, JIT_V2);						\
+  sp_delta = -(int)sizeof (PTR);					\
 } while(0)
 
 /* Do a conditional jump to tree->jumpDest if the top of the stack
  * is successOOP, or to non_boolean_code if it is anything but failOOP.  */
 #define CONDITIONAL_JUMP(successOOP, failOOP) do {			\
-  jit_insn *addr;							\
+  jit_node_t *jump;							\
   									\
   /* Save the value of the top of the stack */				\
   if (sp_delta < 0) { 							\
-    jit_ldr_p(JIT_R0, JIT_V2);						\
+    jit_ldr(JIT_R0, JIT_V2);						\
   } else {								\
-    jit_movr_p(JIT_R0, JIT_V0);						\
+    jit_movr(JIT_R0, JIT_V0);						\
   }									\
   POP_EXPORT_SP;							\
 									\
-  addr = lbl_get(tree->jumpDest);					\
-  addr = jit_beqi_p(addr, JIT_R0, successOOP);				\
-  lbl_use(tree->jumpDest, addr);					\
-  jit_bnei_p(non_boolean_code, JIT_R0, failOOP);			\
-									\
+  jump = jit_beqi(JIT_R0, (jit_word_t)successOOP);			\
+  jit_patch_at(jump, tree->jumpDest);					\
+  jump = jit_beqi(JIT_R0, (jit_word_t)failOOP);				\
+  jit_patch_abs(jit_jmpi(), non_boolean_code);				\
+  jit_patch(jump);							\
   CACHE_NOTHING;							\
 } while(0)
 
@@ -1279,7 +1299,7 @@ defer_send (code_tree *tree, mst_Boolean isBool, jit_insn *address, int reg0, in
  * the equivalent of the `jump lookahead' option in the bytecode interpreter.
  */
 #define INLINED_CONDITIONAL do {					\
-  jit_insn *addr;							\
+  jit_node_t *jmp;							\
   									\
   switch (tree->operation & TREE_EXTRA) {				\
     case TREE_EXTRA_NONE:						\
@@ -1288,23 +1308,22 @@ defer_send (code_tree *tree, mst_Boolean isBool, jit_insn *address, int reg0, in
     case TREE_EXTRA_METHOD_RET:						\
     case TREE_EXTRA_JMP_ALWAYS:						\
       FALSE_SET(JIT_R0);						\
-      jit_lshi_i(JIT_R0, JIT_R0, LONG_SHIFT+1);				\
-      jit_addi_p(JIT_V0, JIT_R0, _gst_true_oop);			\
+      jit_lshi(JIT_R0, JIT_R0, LONG_SHIFT+1);				\
+      jit_addi(JIT_V0, JIT_R0, (jit_word_t)_gst_true_oop);		\
       break;								\
 									\
     case TREE_EXTRA_JMP_TRUE:						\
     case TREE_EXTRA_JMP_FALSE:						\
       if (sp_delta) { 							\
-	jit_addi_p(JIT_V2, JIT_V2, sp_delta);				\
+	jit_addi(JIT_V2, JIT_V2, sp_delta);				\
       }									\
-      sp_delta = -sizeof (PTR);						\
-      addr = lbl_get(tree->jumpDest);					\
+      sp_delta = -(int)sizeof (PTR);					\
       if ((tree->operation & TREE_EXTRA) == TREE_EXTRA_JMP_TRUE) {	\
-        TRUE_BRANCH(addr);						\
+        TRUE_BRANCH(jmp);						\
       } else {								\
-        FALSE_BRANCH(addr);						\
+        FALSE_BRANCH(jmp);						\
       }									\
-      lbl_use(tree->jumpDest, addr);					\
+      jit_patch_at(jmp, tree->jumpDest);				\
 									\
       /* Change the code_tree's operation to TREE_ALREADY_EMITTED */	\
       tree->operation &= TREE_CLASS_CHECKS;				\
@@ -1326,7 +1345,7 @@ defer_send (code_tree *tree, mst_Boolean isBool, jit_insn *address, int reg0, in
  * been loaded.
  */
 #define GET_BINARY_ARGS do {						\
-  code_tree *second = tree->child->next;					\
+  code_tree *second = tree->child->next;				\
 									\
   emit_code_tree(tree->child);						\
   oop = NULL;								\
@@ -1334,14 +1353,14 @@ defer_send (code_tree *tree, mst_Boolean isBool, jit_insn *address, int reg0, in
   reg1 = JIT_V1;							\
   if (IS_LITERAL(second)) {						\
     if (sp_delta < 0) {							\
-      jit_ldr_p(JIT_V0, JIT_V2);					\
+      jit_ldr(JIT_V0, JIT_V2);						\
     }									\
     reg1 = JIT_NOREG;							\
     oop = (OOP) second->data;						\
   } else if (IS_PUSH(second)) { 					\
     if (sp_delta < 0) {							\
-      jit_ldr_p(JIT_V0, JIT_V2);					\
-      jit_addi_p(JIT_V2, JIT_V2, sp_delta);				\
+      jit_ldr(JIT_V0, JIT_V2);						\
+      jit_addi(JIT_V2, JIT_V2, sp_delta);				\
       sp_delta = 0;							\
     }									\
     /* Load the second operand into V1 */				\
@@ -1351,11 +1370,11 @@ defer_send (code_tree *tree, mst_Boolean isBool, jit_insn *address, int reg0, in
     emit_code_tree(second);						\
     if (sp_delta < 0) {							\
       /* We load the 2nd argument and then the 1st */			\
-      jit_ldr_p(JIT_V1, JIT_V2);					\
-      jit_ldxi_p(JIT_V0, JIT_V2, -sizeof (PTR));				\
+      jit_ldr(JIT_V1, JIT_V2);						\
+      jit_ldxi(JIT_V0, JIT_V2, -(int)sizeof (PTR));			\
     } else { 								\
       /* We load the 1st argument; the 2nd is already in V0 */		\
-      jit_ldxi_p(JIT_V1, JIT_V2, sp_delta);				\
+      jit_ldxi(JIT_V1, JIT_V2, sp_delta);				\
       reg0 = JIT_V1;							\
       reg1 = JIT_V0;							\
     }									\
@@ -1364,7 +1383,7 @@ defer_send (code_tree *tree, mst_Boolean isBool, jit_insn *address, int reg0, in
   }									\
   									\
   if (sp_delta) {							\
-    jit_addi_p(JIT_V2, JIT_V2, sp_delta);				\
+    jit_addi(JIT_V2, JIT_V2, sp_delta);					\
     sp_delta = 0;							\
   }									\
   CACHE_NOTHING;							\
@@ -1375,7 +1394,7 @@ defer_send (code_tree *tree, mst_Boolean isBool, jit_insn *address, int reg0, in
  * arguments are not SmallIntegers.
  */
 #define ENSURE_INT_ARGS(isBool, overflow) do {				\
-  jit_insn	*classCheck;						\
+  jit_node_t	*classCheck;						\
 									\
   if (IS_INTEGER(tree->child) && IS_INTEGER(tree->child->next)) {	\
     if (isBool || IS_INTEGER(tree)) {					\
@@ -1385,15 +1404,15 @@ defer_send (code_tree *tree, mst_Boolean isBool, jit_insn *address, int reg0, in
     }									\
     classCheck = NULL;							\
   } else if (IS_INTEGER(tree->child)) { 				\
-    classCheck = jit_bmci_ul(jit_forward(), reg1, 1);			\
+    classCheck = jit_bmci(reg1, 1);					\
   } else if (IS_INTEGER(tree->child->next)) {				\
-    classCheck = jit_bmci_ul(jit_forward(), reg0, 1);			\
+    classCheck = jit_bmci(reg0, 1);					\
   } else { 								\
-    jit_andr_ul(JIT_R2, JIT_V0, JIT_V1);				\
-    classCheck = jit_bmci_ul(jit_forward(), JIT_R2, 1);			\
+    jit_andr(JIT_R2, JIT_V0, JIT_V1);					\
+    classCheck = jit_bmci(JIT_R2, 1);					\
   }									\
 									\
-  defer_send(tree, isBool, classCheck, reg0, reg1, oop);			\
+  defer_send(tree, isBool, classCheck, reg0, reg1, oop);		\
   overflow = last_deferred_send();					\
 } while(0)
 
@@ -1401,10 +1420,14 @@ defer_send (code_tree *tree, mst_Boolean isBool, jit_insn *address, int reg0, in
  * `second operand is a literal' and `second operand is a register'
  * cases in a single statement.  */
 #define EXPAND_(what)		what
-#define IMM_OR_REG(opcode, a)					 \
-	((reg1 != JIT_NOREG) 					 \
-		? EXPAND_(jit_##opcode##r_l(a, reg0, reg1))	 \
-		: EXPAND_(jit_##opcode##i_l(a, reg0, (intptr_t) oop)))
+#define JMP_IMM_OR_REG(opcode)						\
+	((reg1 != JIT_NOREG) 						\
+		? EXPAND_(jit_##opcode##r(reg0, reg1))			\
+		: EXPAND_(jit_##opcode##i(reg0, (jit_word_t)oop)))
+#define CMP_IMM_OR_REG(opcode, reg)					\
+	((reg1 != JIT_NOREG) 						\
+		? EXPAND_(jit_##opcode##r(reg, reg0, reg1))		\
+		: EXPAND_(jit_##opcode##i(reg, reg0, (jit_word_t)oop)))
 
 
 
@@ -1414,24 +1437,44 @@ gen_send (code_tree *tree)
 {
   inline_cache *ic = (inline_cache *) tree->data;
 
+#if 1
+      jit_note(method_name, __LINE__);
+#endif
   PUSH_CHILDREN;
-  jit_movi_p (JIT_V1, ic);
+#if 1
+      jit_note(method_name, __LINE__);
+#endif
+  jit_movi (JIT_V1, (jit_word_t)ic);
+#if 1
+      jit_note(method_name, __LINE__);
+#endif
   if (ic->is_super)
     KEEP_V0_EXPORT_SP;
   else
     EXPORT_SP (JIT_V0);
+#if 1
+      jit_note(method_name, __LINE__);
+#endif
 
-  jit_movi_ul (JIT_R0, tree->bp - bc + tree->bc_len);
-  jit_ldxi_p (JIT_R1, JIT_V1, jit_field (inline_cache, cachedIP));
-  jit_sti_ul (&ip, JIT_R0);
+  jit_movi (JIT_R0, tree->bp - bc + tree->bc_len);
+  jit_ldxi (JIT_R1, JIT_V1, offsetof (inline_cache, cachedIP));
+  jit_sti (&ip, JIT_R0);
 
+#if 1
+      jit_note(method_name, __LINE__);
+#endif
   jit_jmpr (JIT_R1);
-  jit_align (2);
 
-  ic->native_ip = jit_get_label ();
+  defer_map_patch (&ic->native_ip);
   define_ip_map_entry (tree->bp - bc + tree->bc_len);
 
+#if 1
+      jit_note(method_name, __LINE__);
+#endif
   IMPORT_SP;
+#if 1
+      jit_note(method_name, __LINE__);
+#endif
   CACHE_NOTHING;
 }
 
@@ -1439,11 +1482,11 @@ void
 gen_binary_int (code_tree *tree)
 {
   inline_cache *ic = (inline_cache *) tree->data;
-  label *overflow;
+  jit_node_t *overflow;
   int reg0, reg1;
   OOP oop;
   intptr_t imm;
-  jit_insn *addr;
+  jit_node_t *jmp;
 
   DONT_INLINE_SUPER;
   DONT_INLINE_NONINTEGER;
@@ -1457,6 +1500,9 @@ gen_binary_int (code_tree *tree)
   switch (ic->imm)
     {
     case PLUS_SPECIAL:
+#if 1
+      jit_note(method_name, __LINE__);
+#endif
       if (reg1 == JIT_NOREG)
 	{
 	  imm--;		/* strip tag bit */
@@ -1464,41 +1510,42 @@ gen_binary_int (code_tree *tree)
 	    {
 	      if (reg0 != JIT_V0)
 		{
-		  jit_movr_l (JIT_V0, reg0);
+		  jit_movr (JIT_V0, reg0);
 		}
 	      break;
 	    }
 
 	  if (overflow)
 	    {
-	      jit_movr_l (JIT_R0, reg0);
-	      addr = lbl_get (overflow);
-	      addr = jit_boaddi_l (addr, JIT_R0, imm);
-	      lbl_use (overflow, addr);
-	      jit_movr_l (JIT_V0, JIT_R0);
+	      jit_movr (JIT_R0, reg0);
+	      jmp = jit_boaddi (JIT_R0, imm);
+	      jit_patch_at (jmp, overflow);
+	      jit_movr (JIT_V0, JIT_R0);
 	    }
 	  else
-	    jit_addi_l (JIT_V0, reg0, imm);
+	    jit_addi (JIT_V0, reg0, imm);
 
 	}
       else
 	{
-	  jit_subi_l (JIT_R0, reg0, 1);	/* remove the tag bit */
+	  jit_subi (JIT_R0, reg0, 1);	/* remove the tag bit */
 	  if (overflow)
 	    {
-	      addr = lbl_get (overflow);
-	      addr = jit_boaddr_l (addr, JIT_R0, reg1);
-	      lbl_use (overflow, addr);
-	      jit_movr_l (JIT_V0, JIT_R0);
+	      jmp = jit_boaddr (JIT_R0, reg1);
+	      jit_patch_at (jmp, overflow);
+	      jit_movr (JIT_V0, JIT_R0);
 	    }
 	  else
-	    jit_addr_l (JIT_V0, reg0, reg1);
+	    jit_addr (JIT_V0, reg0, reg1);
 	}
       break;
 
 
 
     case MINUS_SPECIAL:
+#if 1
+      jit_note(method_name, __LINE__);
+#endif
       if (reg1 == JIT_NOREG)
 	{
 	  imm--;		/* strip tag bit */
@@ -1506,38 +1553,36 @@ gen_binary_int (code_tree *tree)
 	    {
 	      if (reg0 != JIT_V0)
 		{
-		  jit_movr_l (JIT_V0, reg0);
+		  jit_movr (JIT_V0, reg0);
 		}
 	      break;
 	    }
 
 	  if (overflow)
 	    {
-	      jit_movr_l (JIT_R0, reg0);
-	      addr = lbl_get (overflow);
-	      addr = jit_bosubi_l (addr, JIT_R0, imm);
-	      lbl_use (overflow, addr);
-	      jit_movr_l (JIT_V0, JIT_R0);
+	      jit_movr (JIT_R0, reg0);
+	      jmp = jit_bosubi (JIT_R0, imm);
+	      jit_patch_at (jmp, overflow);
+	      jit_movr (JIT_V0, JIT_R0);
 	    }
 	  else
-	    jit_subi_l (JIT_V0, reg0, imm);
+	    jit_subi (JIT_V0, reg0, imm);
 
 	}
       else
 	{
 	  if (overflow)
 	    {
-	      jit_movr_l (JIT_R0, reg0);
-	      addr = lbl_get (overflow);
-	      addr = jit_bosubr_l (addr, JIT_R0, reg1);
-	      lbl_use (overflow, addr);
-	      jit_addi_l (JIT_V0, JIT_R0, 1);	/* add back the tag bit 
+	      jit_movr (JIT_R0, reg0);
+	      jmp = jit_bosubr (JIT_R0, reg1);
+	      jit_patch_at (jmp, overflow);
+	      jit_addi (JIT_V0, JIT_R0, 1);	/* add back the tag bit 
 						 */
 	    }
 	  else
 	    {
-	      jit_subr_l (JIT_V0, reg0, reg1);
-	      jit_addi_l (JIT_V0, JIT_V0, 1);	/* add back the tag bit 
+	      jit_subr (JIT_V0, reg0, reg1);
+	      jit_addi (JIT_V0, JIT_V0, 1);	/* add back the tag bit 
 						 */
 	    }
 	}
@@ -1546,117 +1591,120 @@ gen_binary_int (code_tree *tree)
 
 
     case TIMES_SPECIAL:
-      if (reg1 == JIT_NOREG)
+#if 1
+      jit_note(method_name, __LINE__);
+#endif
+	if (reg1 == JIT_NOREG)
 	{
-	  jit_insn *addr1, *addr2;
+	  jit_node_t *addr1, *addr2;
 	  int reduce;
 
 	  imm >>= 1;
 	  if (imm == 0)
 	    {
-	      jit_movi_p (JIT_V0, FROM_INT (0));
+	      jit_movi (JIT_V0, (jit_word_t)FROM_INT (0));
 	      break;
 	    }
 	  else if (imm == 1)
 	    {
 	      if (reg0 != JIT_V0)
-		jit_movr_p (JIT_V0, reg0);
+		jit_movr (JIT_V0, reg0);
 	      break;
 	    }
 	  else if (imm == -1)
 	    {
 	      if (overflow)
 		{
-		  addr = lbl_get (overflow);
-		  addr = jit_beqi_p (addr, reg0, FROM_INT (MIN_ST_INT));
-		  lbl_use (overflow, addr);
+		  jmp = jit_beqi (reg0, (jit_word_t)FROM_INT (MIN_ST_INT));
+		  jit_patch_at (jmp, overflow);
 		}
-	      jit_rsbi_l (JIT_V0, reg0, 2);
+	      jit_rsbi (JIT_V0, reg0, 2);
 	      break;
 	    }
 
 	  if (overflow)
 	    {
-	      addr = lbl_get (overflow);
 	      if (imm < 0)
 		{
 		  addr1 =
-		    jit_blti_p (addr, reg0,
-				FROM_INT (MIN_ST_INT / -imm));
+		    jit_blti (reg0,
+			      (jit_word_t)FROM_INT (MIN_ST_INT / -imm));
 		  addr2 =
-		    jit_bgti_p (addr, reg0,
-				FROM_INT (MAX_ST_INT / -imm));
+		    jit_bgti (reg0,
+			      (jit_word_t)FROM_INT (MAX_ST_INT / -imm));
 		}
 	      else
 		{
 		  addr1 =
-		    jit_blti_p (addr, reg0,
-				FROM_INT (MIN_ST_INT / imm));
+		    jit_blti (reg0,
+			      (jit_word_t)FROM_INT (MIN_ST_INT / imm));
 		  addr2 =
-		    jit_bgti_p (addr, reg0,
-				FROM_INT (MAX_ST_INT / imm));
+		    jit_bgti (reg0,
+			      (jit_word_t)FROM_INT (MAX_ST_INT / imm));
 		}
-	      lbl_use (overflow, addr1);
-	      lbl_use (overflow, addr2);
+	      jit_patch_at (addr1, overflow);
+	      jit_patch_at (addr2, overflow);
 	    }
 
 	  /* Do some strength reduction...  */
 	  reduce = analyze_factor (imm);
 	  if (reduce == 0)
-	    jit_muli_l (JIT_V0, reg0, imm);
+	    jit_muli (JIT_V0, reg0, imm);
 
 	  else if ((reduce & 0x00FF00) == 0)
-	    jit_lshi_l (JIT_V0, reg0, reduce);
+	    jit_lshi (JIT_V0, reg0, reduce);
 
 	  else if (reduce & 255)
 	    {
-	      jit_lshi_l (JIT_R0, reg0, reduce & 255);
-	      jit_lshi_l (JIT_V0, reg0, reduce >> 8);
-	      jit_addr_l (JIT_V0, JIT_V0, JIT_R0);
+	      jit_lshi (JIT_R0, reg0, reduce & 255);
+	      jit_lshi (JIT_V0, reg0, reduce >> 8);
+	      jit_addr (JIT_V0, JIT_V0, JIT_R0);
 	    }
 	  else
 	    {
-	      jit_lshi_l (JIT_R0, reg0, reduce >> 8);
-	      jit_addr_l (JIT_V0, reg0, JIT_R0);
+	      jit_lshi (JIT_R0, reg0, reduce >> 8);
+	      jit_addr (JIT_V0, reg0, JIT_R0);
 	    }
 
 	  /* remove the excess due to the tag bit: ((x-1) / 2 * imm) *
 	     2 + 1 = x * imm - imm + 1 = (x*imm) - (imm-1) */
-	  jit_subi_l (JIT_V0, reg0, imm - 1);
+	  jit_subi (JIT_V0, reg0, imm - 1);
 
 	}
       else
 	{
-	  jit_rshi_l (JIT_R1, reg0, 1);
-	  jit_rshi_l (JIT_R0, reg1, 1);
-	  jit_mulr_l (JIT_R2, JIT_R0, JIT_R1);
+	  jit_rshi (JIT_R1, reg0, 1);
+	  jit_rshi (JIT_R0, reg1, 1);
 	  if (overflow)
 	    {
-	      jit_hmulr_l (JIT_R0, JIT_R0, JIT_R1);	/* compute high 
-							   bits */
+	      jit_qmulr (JIT_R2, JIT_R0, JIT_R0, JIT_R1);	/* compute high 
+								   bits */
 
 	      /* check for sensible bits of the result in R0, and in
 	         bits 30-31 of R2 */
-	      jit_rshi_i (JIT_R1, JIT_R0, sizeof (PTR) * 8 - 1);
-	      addr = lbl_get (overflow);
-	      addr = jit_bner_l (addr, JIT_R0, JIT_R1);
-	      lbl_use (overflow, addr);
+	      jit_rshi (JIT_R1, JIT_R0, sizeof (PTR) * 8 - 1);
+	      jmp = jit_bner (JIT_R0, JIT_R1);
+	      jit_patch_at (jmp, overflow);
 
-	      jit_xorr_i (JIT_R1, JIT_R0, JIT_R2);
-	      addr = lbl_get (overflow);
-	      addr =
-		jit_bmsi_l (addr, JIT_R1, 3 << (sizeof (PTR) * 8 - 2));
-	      lbl_use (overflow, addr);
+	      jit_xorr (JIT_R1, JIT_R0, JIT_R2);
+	      jmp =
+		jit_bmsi (JIT_R1, 3UL << (sizeof (PTR) * 8 - 2));
+	      jit_patch_at (jmp, overflow);
 	    }
+	  else
+	    jit_mulr (JIT_R2, JIT_R0, JIT_R1);
 
-	  jit_addr_l (JIT_V0, JIT_R2, JIT_R2);
-	  jit_ori_l (JIT_V0, JIT_V0, 1);
+	  jit_addr (JIT_V0, JIT_R2, JIT_R2);
+	  jit_ori (JIT_V0, JIT_V0, 1);
 	}
       break;
 
 
 
     case INTEGER_DIVIDE_SPECIAL:
+#if 1
+      jit_note(method_name, __LINE__);
+#endif
       if (reg1 == JIT_NOREG)
 	{
 	  int shift;
@@ -1666,46 +1714,44 @@ gen_binary_int (code_tree *tree)
 	  imm >>= 1;
 	  if (imm == 0)
 	    {
-	      addr = lbl_get (overflow);
-	      addr = jit_jmpi (addr);
-	      lbl_use (overflow, addr);
+	      jmp = jit_jmpi ();
+	      jit_patch_at (jmp, overflow);
 	      break;
 	    }
 	  else if (imm == 1)
 	    {
 	      if (reg0 != JIT_V0)
-		jit_movr_p (JIT_V0, reg0);
+		jit_movr (JIT_V0, reg0);
 	      break;
 	    }
 	  else if (imm == -1)
 	    {
 	      if (overflow)
 		{
-		  addr = lbl_get (overflow);
-		  addr = jit_beqi_p (addr, reg0, FROM_INT (MIN_ST_INT));
-		  lbl_use (overflow, addr);
+		  jmp = jit_beqi (reg0, (jit_word_t)FROM_INT (MIN_ST_INT));
+		  jit_patch_at (jmp, overflow);
 		}
-	      jit_rsbi_l (JIT_V0, reg0, 2);
+	      jit_rsbi (JIT_V0, reg0, 2);
 	      break;
 	    }
 
-	  jit_rshi_l (reg0, reg0, 1);
+	  jit_rshi (reg0, reg0, 1);
 
 	  if (imm < 0)
 	    {
-	      jit_negr_l (reg0, reg0);
+	      jit_negr (reg0, reg0);
 	      imm = -imm;
 	    }
 
 	  /* Fix the sign of the result: reg0 = imm - _gst_self - 1 if
 	     reg0 < 0 All these instructions are no-ops if reg0 > 0,
 	     because R0=R1=0 */
-	  jit_rshi_l (JIT_R0, reg0, 8 * sizeof (PTR) - 1);
-	  jit_andi_l (JIT_R1, JIT_R0, imm - 1);	/* if reg0 < 0, reg0
+	  jit_rshi (JIT_R0, reg0, 8 * sizeof (PTR) - 1);
+	  jit_andi (JIT_R1, JIT_R0, imm - 1);	/* if reg0 < 0, reg0
 						   is...  */
-	  jit_subr_l (reg0, reg0, JIT_R1);	/* _gst_self - imm + 1 */
-	  jit_xorr_l (reg0, reg0, JIT_R0);	/* imm - _gst_self - 2 */
-	  jit_subr_l (reg0, reg0, JIT_R0);	/* imm - _gst_self - 1 */
+	  jit_subr (reg0, reg0, JIT_R1);	/* _gst_self - imm + 1 */
+	  jit_xorr (reg0, reg0, JIT_R0);	/* imm - _gst_self - 2 */
+	  jit_subr (reg0, reg0, JIT_R0);	/* imm - _gst_self - 1 */
 
 	  /* Do some strength reduction...  */
 	  analyze_dividend (imm, &shift, &adjust, &factor);
@@ -1714,68 +1760,67 @@ gen_binary_int (code_tree *tree)
 	    {
 	      /* If adjust is true, we have to sum 1 here, and the
 	         carry after the multiplication.  */
-	      jit_movi_l (JIT_R1, 0);
-	      jit_addci_l (reg0, reg0, 1);
-	      jit_addxi_l (JIT_R1, JIT_R1, 0);
+	      jit_movi (JIT_R1, 0);
+	      jit_addci (reg0, reg0, 1);
+	      jit_addxi (JIT_R1, JIT_R1, 0);
 	    }
 
 	  shift--;		/* for the tag bit */
 	  if (factor)
-	    jit_hmuli_l (reg0, reg0, factor);
+	    jit_qmuli (JIT_R2, reg0, reg0, factor);
 
 	  if (shift < 0)
-	    jit_lshi_l (reg0, reg0, -shift);
+	    jit_lshi (reg0, reg0, -shift);
 	  else if (shift > 0)
-	    jit_rshi_l (reg0, reg0, shift);
+	    jit_rshi (reg0, reg0, shift);
 
 	  if (adjust)
-	    jit_subr_l (reg0, reg0, JIT_R1);
+	    jit_subr (reg0, reg0, JIT_R1);
 
 	  /* negate the result if the signs were different */
-	  jit_xorr_l (reg0, reg0, JIT_R0);
-	  jit_subr_l (reg0, reg0, JIT_R0);
+	  jit_xorr (reg0, reg0, JIT_R0);
+	  jit_subr (reg0, reg0, JIT_R0);
 
 	  /* now add the tag bit */
-	  jit_ori_l (JIT_V0, reg0, 1);
+	  jit_ori (JIT_V0, reg0, 1);
 
 	}
       else
 	{
 	  if (overflow)
 	    {
-	      addr = lbl_get (overflow);
-	      addr = jit_beqi_p (addr, reg1, FROM_INT (0));
-	      lbl_use (overflow, addr);
+	      jmp = jit_beqi (reg1, (jit_word_t)FROM_INT (0));
+	      jit_patch_at (jmp, overflow);
 	    }
 
-	  jit_rshi_l (reg1, reg1, 1);
-	  jit_rshi_l (reg0, reg0, 1);
+	  jit_rshi (reg1, reg1, 1);
+	  jit_rshi (reg0, reg0, 1);
 
 	  /* Make the divisor positive */
-	  jit_rshi_l (JIT_R0, reg1, 8 * sizeof (PTR) - 1);
-	  jit_xorr_l (reg0, reg0, JIT_R0);
-	  jit_xorr_l (reg1, reg1, JIT_R0);
-	  jit_subr_l (reg0, reg0, JIT_R0);
-	  jit_subr_l (reg1, reg1, JIT_R0);
+	  jit_rshi (JIT_R0, reg1, 8 * sizeof (PTR) - 1);
+	  jit_xorr (reg0, reg0, JIT_R0);
+	  jit_xorr (reg1, reg1, JIT_R0);
+	  jit_subr (reg0, reg0, JIT_R0);
+	  jit_subr (reg1, reg1, JIT_R0);
 
 	  /* Fix the result if signs differ: reg0 -= reg1-1 */
-	  jit_rshi_l (JIT_R1, reg0, 8 * sizeof (PTR) - 1);
-	  jit_subi_l (JIT_R0, reg1, 1);
-	  jit_andr_l (JIT_R0, JIT_R0, JIT_R1);	/* if reg0 < 0, reg0
+	  jit_rshi (JIT_R1, reg0, 8 * sizeof (PTR) - 1);
+	  jit_subi (JIT_R0, reg1, 1);
+	  jit_andr (JIT_R0, JIT_R0, JIT_R1);	/* if reg0 < 0, reg0
 						   is...  */
-	  jit_subr_l (reg0, reg0, JIT_R0);	/* _gst_self - imm + 1 */
-	  jit_xorr_l (reg0, reg0, JIT_R1);	/* imm - _gst_self - 2 */
-	  jit_subr_l (reg0, reg0, JIT_R1);	/* imm - _gst_self - 1 */
+	  jit_subr (reg0, reg0, JIT_R0);	/* _gst_self - imm + 1 */
+	  jit_xorr (reg0, reg0, JIT_R1);	/* imm - _gst_self - 2 */
+	  jit_subr (reg0, reg0, JIT_R1);	/* imm - _gst_self - 1 */
 
 	  /* divide, then negate the result if the signs were different 
 	   */
-	  jit_divr_l (JIT_R0, reg0, reg1);
-	  jit_xorr_l (JIT_R0, JIT_R0, JIT_R1);
-	  jit_subr_l (JIT_R0, JIT_R0, JIT_R1);
+	  jit_divr (JIT_R0, reg0, reg1);
+	  jit_xorr (JIT_R0, JIT_R0, JIT_R1);
+	  jit_subr (JIT_R0, JIT_R0, JIT_R1);
 
 	  /* add the tag bit */
-	  jit_addr_l (JIT_V0, JIT_R0, JIT_R0);
-	  jit_ori_l (JIT_V0, JIT_V0, 1);
+	  jit_addr (JIT_V0, JIT_R0, JIT_R0);
+	  jit_ori (JIT_V0, JIT_V0, 1);
 	}
       break;
 
@@ -1783,37 +1828,54 @@ gen_binary_int (code_tree *tree)
 
     case REMAINDER_SPECIAL:
     case BIT_SHIFT_SPECIAL:
+#if 1
+      jit_note(method_name, __LINE__);
+#endif
       /* not yet */
-      addr = lbl_get (overflow);
-      addr = jit_jmpi (addr);
-      lbl_use (overflow, addr);
+      jmp = jit_jmpi ();
+      jit_patch_at (jmp, overflow);
       break;
 
     case BIT_AND_SPECIAL:
-      IMM_OR_REG (and, JIT_V0);
+#if 1
+      jit_note(method_name, __LINE__);
+#endif
+      CMP_IMM_OR_REG (and, JIT_V0);
       break;
     case BIT_OR_SPECIAL:
-      IMM_OR_REG (or, JIT_V0);
+#if 1
+      jit_note(method_name, __LINE__);
+#endif
+      CMP_IMM_OR_REG (or, JIT_V0);
       break;
 
     case BIT_XOR_SPECIAL:
+#if 1
+      jit_note(method_name, __LINE__);
+#endif
       /* For XOR, the tag bits of the two operands cancel (unlike
-	 AND and OR), so we cannot simply use the IMM_OR_REG macro.  */
+	 AND and OR), so we cannot simply use the CMP_IMM_OR_REG macro.  */
       if (reg1 != JIT_NOREG)
 	{
-	  jit_xorr_l(JIT_V0, reg0, reg1);
-	  jit_addi_l(JIT_V0, JIT_V0, 1);	/* Put back the tag bit.  */
+	  jit_xorr(JIT_V0, reg0, reg1);
+	  jit_addi(JIT_V0, JIT_V0, 1);	/* Put back the tag bit.  */
 	}
       else
 	{
 	  imm--;				/* Strip the tag bit.  */
-	  jit_xori_l(JIT_V0, reg0, imm);
+	  jit_xori(JIT_V0, reg0, imm);
 	}
 
       break;
     }
+#if 1
+      jit_note(method_name, __LINE__);
+#endif
 
   EXPORT_SP (JIT_V0);
+#if 1
+      jit_note(method_name, __LINE__);
+#endif
   if (overflow)
     finish_deferred_send ();
 }
@@ -1822,7 +1884,7 @@ void
 gen_binary_bool (code_tree *tree)
 {
   inline_cache *ic = (inline_cache *) tree->data;
-  label *deferredSend;
+  jit_node_t *deferredSend;
   int reg0, reg1;
   OOP oop;
 
@@ -1837,37 +1899,37 @@ gen_binary_bool (code_tree *tree)
   else
     deferredSend = NULL;
 
-#define TRUE_BRANCH(addr)						\
+#define TRUE_BRANCH(jmp)						\
   switch(ic->imm) {							\
-    case LESS_THAN_SPECIAL:	addr = IMM_OR_REG(blt, addr); break;	\
-    case GREATER_THAN_SPECIAL:	addr = IMM_OR_REG(bgt, addr); break;	\
-    case LESS_EQUAL_SPECIAL:	addr = IMM_OR_REG(ble, addr); break;	\
-    case GREATER_EQUAL_SPECIAL:	addr = IMM_OR_REG(bge, addr); break;	\
+    case LESS_THAN_SPECIAL:	jmp = JMP_IMM_OR_REG(blt); break;	\
+    case GREATER_THAN_SPECIAL:	jmp = JMP_IMM_OR_REG(bgt); break;	\
+    case LESS_EQUAL_SPECIAL:	jmp = JMP_IMM_OR_REG(ble); break;	\
+    case GREATER_EQUAL_SPECIAL:	jmp = JMP_IMM_OR_REG(bge); break;	\
     case SAME_OBJECT_SPECIAL:						\
-    case EQUAL_SPECIAL:		addr = IMM_OR_REG(beq, addr); break;	\
-    case NOT_EQUAL_SPECIAL:	addr = IMM_OR_REG(bne, addr); break;	\
+    case EQUAL_SPECIAL:		jmp = JMP_IMM_OR_REG(beq); break;	\
+    case NOT_EQUAL_SPECIAL:	jmp = JMP_IMM_OR_REG(bne); break;	\
   }
 
-#define FALSE_BRANCH(addr)						\
+#define FALSE_BRANCH(jmp)						\
   switch(ic->imm) {							\
-    case LESS_THAN_SPECIAL:	addr = IMM_OR_REG(bge, addr); break;	\
-    case GREATER_THAN_SPECIAL:	addr = IMM_OR_REG(ble, addr); break;	\
-    case LESS_EQUAL_SPECIAL:	addr = IMM_OR_REG(bgt, addr); break;	\
-    case GREATER_EQUAL_SPECIAL:	addr = IMM_OR_REG(blt, addr); break;	\
+    case LESS_THAN_SPECIAL:	jmp = JMP_IMM_OR_REG(bge); break;	\
+    case GREATER_THAN_SPECIAL:	jmp = JMP_IMM_OR_REG(ble); break;	\
+    case LESS_EQUAL_SPECIAL:	jmp = JMP_IMM_OR_REG(bgt); break;	\
+    case GREATER_EQUAL_SPECIAL:	jmp = JMP_IMM_OR_REG(blt); break;	\
     case SAME_OBJECT_SPECIAL:						\
-    case EQUAL_SPECIAL:		addr = IMM_OR_REG(bne, addr); break;	\
-    case NOT_EQUAL_SPECIAL:	addr = IMM_OR_REG(beq, addr); break;	\
+    case EQUAL_SPECIAL:		jmp = JMP_IMM_OR_REG(bne); break;	\
+    case NOT_EQUAL_SPECIAL:	jmp = JMP_IMM_OR_REG(beq); break;	\
   }
 
 #define FALSE_SET(reg)							\
   switch(ic->imm) {							\
-    case LESS_THAN_SPECIAL:	IMM_OR_REG(ge, reg); break;		\
-    case GREATER_THAN_SPECIAL:	IMM_OR_REG(le, reg); break;		\
-    case LESS_EQUAL_SPECIAL:	IMM_OR_REG(gt, reg); break;		\
-    case GREATER_EQUAL_SPECIAL:	IMM_OR_REG(lt, reg); break;		\
+    case LESS_THAN_SPECIAL:	CMP_IMM_OR_REG(ge, reg); break;		\
+    case GREATER_THAN_SPECIAL:	CMP_IMM_OR_REG(le, reg); break;		\
+    case LESS_EQUAL_SPECIAL:	CMP_IMM_OR_REG(gt, reg); break;		\
+    case GREATER_EQUAL_SPECIAL:	CMP_IMM_OR_REG(lt, reg); break;		\
     case SAME_OBJECT_SPECIAL:						\
-    case EQUAL_SPECIAL:		IMM_OR_REG(ne, reg); break;		\
-    case NOT_EQUAL_SPECIAL:	IMM_OR_REG(eq, reg); break;		\
+    case EQUAL_SPECIAL:		CMP_IMM_OR_REG(ne, reg); break;		\
+    case NOT_EQUAL_SPECIAL:	CMP_IMM_OR_REG(eq, reg); break;		\
   }
 
   INLINED_CONDITIONAL;
@@ -1884,11 +1946,11 @@ void
 gen_send_store_lit_var (code_tree *tree)
 {
   inline_cache *ic = (inline_cache *) tree->data;
-  label *overflow;
+  jit_node_t *overflow;
   int reg0, reg1;
   OOP oop;
   intptr_t imm;
-  jit_insn *addr;
+  jit_node_t *addr;
 
   /* tree->child = value
      tree->child->next = var.  */
@@ -1905,9 +1967,9 @@ gen_dirty_block (code_tree *tree)
   GET_UNARY_ARG;
 
   KEEP_V0_EXPORT_SP;
-  jit_prepare (1);
-  jit_pusharg_p (JIT_V0);
-  jit_finish (_gst_make_block_closure);
+  jit_prepare ();
+  jit_pushargr (JIT_V0);
+  jit_finishi (_gst_make_block_closure);
   jit_retval (JIT_V0);
 
   KEEP_V0_IMPORT_SP;
@@ -1924,22 +1986,22 @@ gen_fetch_class (code_tree *tree)
   GET_UNARY_ARG;
 
   if (IS_INTEGER (tree->child))
-    jit_movi_p (JIT_V0, _gst_small_integer_class);
+    jit_movi (JIT_V0, _gst_small_integer_class);
 
   else if (NOT_INTEGER (tree->child))
     {
-      jit_ldxi_p (JIT_V0, JIT_V0, jit_ptr_field (OOP, object));
-      jit_ldxi_p (JIT_V0, JIT_V0, jit_ptr_field (gst_object, objClass));
+      jit_ldxi (JIT_V0, JIT_V0, offsetof (struct oop_s, object));
+      jit_ldxi (JIT_V0, JIT_V0, offsetof (struct object_s, objClass));
     }
   else
     {
-      jit_insn *jmp;
-      jit_movi_p (JIT_R0, _gst_small_integer_class);
-      jmp = jit_bmsi_ul (jit_forward (), JIT_V0, 1);
-      jit_ldxi_p (JIT_R0, JIT_V0, jit_ptr_field (OOP, object));
-      jit_ldxi_p (JIT_R0, JIT_R0, jit_ptr_field (gst_object, objClass));
+      jit_node_t *jmp;
+      jit_movi (JIT_R0, _gst_small_integer_class);
+      jmp = jit_bmsi (JIT_V0, 1);
+      jit_ldxi (JIT_R0, JIT_V0, offsetof (struct oop_s, object));
+      jit_ldxi (JIT_R0, JIT_R0, offsetof (struct object_s, objClass));
       jit_patch (jmp);
-      jit_movr_p (JIT_V0, JIT_R0);
+      jit_movr (JIT_V0, JIT_R0);
     }
 
   self_cached = false;
@@ -1950,7 +2012,7 @@ void
 gen_unary_special (code_tree *tree)
 {
   inline_cache *ic = (inline_cache *) tree->data;
-  jit_insn *ok1 = NULL, *bad1, *ok2, *ok3;
+  jit_node_t *ok1 = NULL, *bad1, *ok2, *ok3;
   int sz;
 
   DONT_INLINE_SUPER;
@@ -1969,17 +2031,17 @@ gen_unary_special (code_tree *tree)
       CACHE_STACK_TOP;
 
       if (!NOT_INTEGER (tree->child))
-	ok1 = jit_bmsi_ul (jit_forward (), JIT_V0, 1);
+	ok1 = jit_bmsi (JIT_V0, 1);
 
       sz = (ic->imm == JAVA_AS_LONG_SPECIAL) ? 8 : 4;
 
-      jit_ldr_p (JIT_R2, JIT_V0);
+      jit_ldr (JIT_R2, JIT_V0);
 
       /* Check if it belongs to the wrong class...  */
-      jit_ldxi_p (JIT_R0, JIT_R2, jit_ptr_field (gst_object, objClass));
-      jit_subi_p (JIT_R0, JIT_R0, _gst_large_positive_integer_class);
-      ok2 = jit_beqi_p (jit_forward (), JIT_R0, NULL);
-      bad1 = jit_bnei_p (jit_forward (), JIT_R0,
+      jit_ldxi (JIT_R0, JIT_R2, offsetof (struct object_s, objClass));
+      jit_subi (JIT_R0, JIT_R0, (jit_word_t)_gst_large_positive_integer_class);
+      ok2 = jit_beqi (JIT_R0, 0);
+      bad1 = jit_bnei (JIT_R0,
 			 ((char *) _gst_large_negative_integer_class) -
 			 ((char *) _gst_large_positive_integer_class));
 
@@ -1988,14 +2050,14 @@ gen_unary_special (code_tree *tree)
       if (SIZEOF_OOP > 4)
 	{
           emit_basic_size_in_r0 (_gst_large_positive_integer_class, false, JIT_R2);
-          ok3 = jit_blei_ui (jit_forward (), JIT_R0, sz);
+          ok3 = jit_blei_u (JIT_R0, sz);
 	}
       else
 	{
            /* We can check the size field directly.  */
-          jit_ldxi_p (JIT_R0, JIT_R2, jit_ptr_field (gst_object, objSize));
-          ok3 = jit_blei_p (jit_forward (), JIT_R0, 
-			    FROM_INT (OBJ_HEADER_SIZE_WORDS + sz / SIZEOF_OOP));
+          jit_ldxi (JIT_R0, JIT_R2, offsetof (struct object_s, objSize));
+          ok3 = jit_blei (JIT_R0,
+			  (jit_word_t)FROM_INT (OBJ_HEADER_SIZE_WORDS + sz / SIZEOF_OOP));
 	}
 
       jit_patch (bad1);
@@ -2021,12 +2083,12 @@ gen_unary_bool (code_tree *tree)
   DONT_INLINE_SUPER;
   GET_UNARY_ARG;
 
-#define TRUE_BRANCH(addr)   addr = compileIsNil ? jit_beqi_p((addr), JIT_V0, _gst_nil_oop) \
-					  	: jit_bnei_p((addr), JIT_V0, _gst_nil_oop)
-#define FALSE_BRANCH(addr)  addr = compileIsNil ? jit_bnei_p((addr), JIT_V0, _gst_nil_oop) \
-					  	: jit_beqi_p((addr), JIT_V0, _gst_nil_oop)
-#define FALSE_SET(reg)		   compileIsNil ? jit_nei_p ((reg),  JIT_V0, _gst_nil_oop) \
-						: jit_eqi_p ((reg),  JIT_V0, _gst_nil_oop)
+#define TRUE_BRANCH(jmp)     jmp = compileIsNil ? jit_beqi(JIT_V0, (jit_word_t)_gst_nil_oop) \
+					        : jit_bnei(JIT_V0, (jit_word_t)_gst_nil_oop)
+#define FALSE_BRANCH(jmp)    jmp = compileIsNil ? jit_bnei(JIT_V0, (jit_word_t)_gst_nil_oop) \
+						: jit_beqi(JIT_V0, (jit_word_t)_gst_nil_oop)
+#define FALSE_SET(reg)		   compileIsNil ? jit_nei ((reg),  JIT_V0, (jit_word_t)_gst_nil_oop) \
+						: jit_eqi ((reg),  JIT_V0, (jit_word_t)_gst_nil_oop)
   INLINED_CONDITIONAL;
 #undef TRUE_BRANCH
 #undef FALSE_BRANCH
@@ -2038,11 +2100,11 @@ gen_pop_into_array (code_tree *tree)
 {
   mst_Boolean useCachedR0;
   code_tree *array, *value;
-  int index;
+  long index;
 
   array = tree->child;
   value = array->next;
-  index = (int) tree->data;
+  index = (long) tree->data;
   useCachedR0 = (array->operation & (TREE_OP | TREE_SUBOP))
     == (TREE_STORE | TREE_POP_INTO_ARRAY);
 
@@ -2055,8 +2117,8 @@ gen_pop_into_array (code_tree *tree)
     {
       if (sp_delta < 0)
 	{
-	  jit_ldr_p (JIT_V0, JIT_V2);
-	  jit_addi_p (JIT_V2, JIT_V2, sp_delta);
+	  jit_ldr (JIT_V0, JIT_V2);
+	  jit_addi (JIT_V2, JIT_V2, sp_delta);
 	  sp_delta = 0;
 	}
       /* Load the value operand into V1 */
@@ -2069,14 +2131,14 @@ gen_pop_into_array (code_tree *tree)
       if (sp_delta < 0)
 	{
 	  /* We load the 2nd argument and then the 1st */
-	  jit_ldr_p (JIT_V1, JIT_V2);
-	  jit_ldxi_p (JIT_V0, JIT_V2, -sizeof (PTR));
+	  jit_ldr (JIT_V1, JIT_V2);
+	  jit_ldxi (JIT_V0, JIT_V2, -(int)sizeof (PTR));
 	}
       else
 	{
 	  /* The 2nd argument is already in V0, move it in V1 */
-	  jit_movr_p (JIT_V1, JIT_V0);
-	  jit_ldxi_p (JIT_V0, JIT_V2, sp_delta);
+	  jit_movr (JIT_V1, JIT_V0);
+	  jit_ldxi (JIT_V0, JIT_V2, sp_delta);
 	}
 
       /* "Pop" the 2nd argument */
@@ -2086,17 +2148,17 @@ gen_pop_into_array (code_tree *tree)
 
   if (sp_delta)
     {
-      jit_addi_p (JIT_V2, JIT_V2, sp_delta);
+      jit_addi (JIT_V2, JIT_V2, sp_delta);
       sp_delta = 0;
     }
 
   if (!useCachedR0)
     {
       /* Dereference the OOP into R0 */
-      jit_ldxi_p (JIT_R0, JIT_V0, jit_ptr_field (OOP, object));
+      jit_ldxi (JIT_R0, JIT_V0, offsetof (struct oop_s, object));
     }
 
-  jit_stxi_p (jit_ptr_field (gst_object, data[index]), JIT_R0, JIT_V1);
+  jit_stxi (offsetof (struct object_s, data) + index * sizeof (OOP), JIT_R0, JIT_V1);
 }
 
 
@@ -2107,7 +2169,7 @@ gen_store_rec_var (code_tree *tree)
   BEFORE_STORE;
   CACHE_REC_VAR;
 
-  jit_stxi_p (REC_VAR_OFS (tree), JIT_R1, JIT_V0);
+  jit_stxi (REC_VAR_OFS (tree), JIT_R1, JIT_V0);
 }
 
 void
@@ -2116,17 +2178,17 @@ gen_store_temp (code_tree *tree)
   BEFORE_STORE;
   CACHE_TEMP;
 
-  jit_stxi_p (TEMP_OFS (tree), JIT_V1, JIT_V0);
+  jit_stxi (TEMP_OFS (tree), JIT_V1, JIT_V0);
 }
 
 void
 gen_store_lit_var (code_tree *tree)
 {
-  char *assocOOP = ((char *) tree->data) + jit_ptr_field (OOP, object);
+  char *assocOOP = ((char *) tree->data) + offsetof (struct oop_s, object);
   BEFORE_STORE;
 
-  jit_ldi_p (JIT_R0, assocOOP);
-  jit_stxi_p (jit_ptr_field (gst_association, value), JIT_R0, JIT_V0);
+  jit_ldi (JIT_R0, assocOOP);
+  jit_stxi (offsetof (struct gst_association, value), JIT_R0, JIT_V0);
 }
 
 void
@@ -2135,7 +2197,7 @@ gen_store_outer (code_tree *tree)
   BEFORE_STORE;
   CACHE_OUTER_CONTEXT;
 
-  jit_stxi_p (STACK_OFS (tree), JIT_V1, JIT_V0);
+  jit_stxi (STACK_OFS (tree), JIT_V1, JIT_V0);
 }
 
 /* Pushes */
@@ -2145,7 +2207,7 @@ gen_push_rec_var (code_tree *tree)
   BEFORE_PUSH (JIT_V0);
   CACHE_REC_VAR;
 
-  jit_ldxi_p (JIT_V0, JIT_R1, REC_VAR_OFS (tree));
+  jit_ldxi (JIT_V0, JIT_R1, REC_VAR_OFS (tree));
   self_cached = false;
 }
 
@@ -2155,7 +2217,7 @@ gen_push_temp (code_tree *tree)
   BEFORE_PUSH (JIT_V0);
   CACHE_TEMP;
 
-  jit_ldxi_p (JIT_V0, JIT_V1, TEMP_OFS (tree));
+  jit_ldxi (JIT_V0, JIT_V1, TEMP_OFS (tree));
   self_cached = false;
 }
 
@@ -2164,18 +2226,18 @@ gen_push_lit_const (code_tree *tree)
 {
   BEFORE_PUSH (JIT_V0);
 
-  jit_movi_p (JIT_V0, tree->data);
+  jit_movi (JIT_V0, (jit_word_t)tree->data);
   self_cached = false;
 }
 
 void
 gen_push_lit_var (code_tree *tree)
 {
-  char *assocOOP = ((char *) tree->data) + jit_ptr_field (OOP, object);
+  char *assocOOP = ((char *) tree->data) + offsetof (struct oop_s, object);
   BEFORE_PUSH (JIT_V0);
 
-  jit_ldi_p (JIT_V0, assocOOP);
-  jit_ldxi_p (JIT_V0, JIT_V0, jit_ptr_field (gst_association, value));
+  jit_ldi (JIT_V0, assocOOP);
+  jit_ldxi (JIT_V0, JIT_V0, offsetof (struct gst_association, value));
   self_cached = false;
 }
 
@@ -2183,7 +2245,7 @@ void
 gen_dup_top (code_tree *tree)
 {
   if (sp_delta < 0)
-    jit_ldr_p (JIT_V0, JIT_V2);
+    jit_ldr (JIT_V0, JIT_V2);
 
   BEFORE_PUSH (JIT_V0);
 }
@@ -2194,7 +2256,7 @@ gen_push_self (code_tree *tree)
   BEFORE_PUSH (JIT_V0);
 
   if (!self_cached)
-    jit_ldi_p (JIT_V0, &_gst_self);
+    jit_ldi (JIT_V0, &_gst_self);
 
   self_cached = true;
 }
@@ -2205,7 +2267,7 @@ gen_push_outer (code_tree *tree)
   BEFORE_PUSH (JIT_V0);
   CACHE_OUTER_CONTEXT;
 
-  jit_ldxi_p (JIT_V0, JIT_V1, STACK_OFS (tree));
+  jit_ldxi (JIT_V0, JIT_V1, STACK_OFS (tree));
   self_cached = false;
 }
 
@@ -2215,7 +2277,7 @@ gen_alt_rec_var (code_tree *tree)
 {
   CACHE_REC_VAR;
 
-  jit_ldxi_p (JIT_V1, JIT_R1, REC_VAR_OFS (tree));
+  jit_ldxi (JIT_V1, JIT_R1, REC_VAR_OFS (tree));
   stack_cached = -1;
 }
 
@@ -2224,24 +2286,24 @@ gen_alt_temp (code_tree *tree)
 {
   CACHE_TEMP;
 
-  jit_ldxi_p (JIT_V1, JIT_V1, TEMP_OFS (tree));
+  jit_ldxi (JIT_V1, JIT_V1, TEMP_OFS (tree));
   stack_cached = -1;
 }
 
 void
 gen_alt_lit_const (code_tree *tree)
 {
-  jit_movi_p (JIT_V1, tree->data);
+  jit_movi (JIT_V1, (jit_word_t)tree->data);
   stack_cached = -1;
 }
 
 void
 gen_alt_lit_var (code_tree *tree)
 {
-  char *assocOOP = ((char *) tree->data) + jit_ptr_field (OOP, object);
+  char *assocOOP = ((char *) tree->data) + offsetof (struct oop_s, object);
 
-  jit_ldi_p (JIT_V1, assocOOP);
-  jit_ldxi_p (JIT_V1, JIT_V1, jit_ptr_field (gst_association, value));
+  jit_ldi (JIT_V1, assocOOP);
+  jit_ldxi (JIT_V1, JIT_V1, offsetof (struct gst_association, value));
   stack_cached = -1;
 }
 
@@ -2249,10 +2311,10 @@ void
 gen_get_top (code_tree *tree)
 {
   if (sp_delta < 0)
-    jit_ldr_p (JIT_V1, JIT_V2);
+    jit_ldr (JIT_V1, JIT_V2);
 
   else
-    jit_movr_p (JIT_V1, JIT_V0);
+    jit_movr (JIT_V1, JIT_V0);
 
   stack_cached = -1;
 }
@@ -2261,10 +2323,10 @@ void
 gen_alt_self (code_tree *tree)
 {
   if (!self_cached)
-    jit_ldi_p (JIT_V1, &_gst_self);
+    jit_ldi (JIT_V1, &_gst_self);
 
   else
-    jit_movr_p (JIT_V1, JIT_V0);
+    jit_movr (JIT_V1, JIT_V0);
 
   stack_cached = -1;
 }
@@ -2274,7 +2336,7 @@ gen_alt_outer (code_tree *tree)
 {
   CACHE_OUTER_CONTEXT;
 
-  jit_ldxi_p (JIT_V1, JIT_V1, STACK_OFS (tree));
+  jit_ldxi (JIT_V1, JIT_V1, STACK_OFS (tree));
   stack_cached = -1;
 }
 
@@ -2285,7 +2347,7 @@ gen_top_rec_var (code_tree *tree)
   BEFORE_SET_TOP;
   CACHE_REC_VAR;
 
-  jit_ldxi_p (JIT_V0, JIT_R1, REC_VAR_OFS (tree));
+  jit_ldxi (JIT_V0, JIT_R1, REC_VAR_OFS (tree));
   self_cached = false;
 }
 
@@ -2295,7 +2357,7 @@ gen_top_temp (code_tree *tree)
   BEFORE_SET_TOP;
   CACHE_TEMP;
 
-  jit_ldxi_p (JIT_V0, JIT_V1, TEMP_OFS (tree));
+  jit_ldxi (JIT_V0, JIT_V1, TEMP_OFS (tree));
   self_cached = false;
 }
 
@@ -2305,7 +2367,7 @@ gen_top_self (code_tree *tree)
   BEFORE_SET_TOP;
 
   if (!self_cached)
-    jit_ldi_p (JIT_V0, &_gst_self);
+    jit_ldi (JIT_V0, &_gst_self);
 
   self_cached = true;
 }
@@ -2318,7 +2380,7 @@ gen_top_outer (code_tree *tree)
   CACHE_OUTER_CONTEXT;
   index = ((gst_uchar *) tree->data)[0];
 
-  jit_ldxi_p (JIT_V0, JIT_V1, STACK_OFS (tree));
+  jit_ldxi (JIT_V0, JIT_V1, STACK_OFS (tree));
   self_cached = false;
 }
 
@@ -2327,19 +2389,19 @@ gen_top_lit_const (code_tree *tree)
 {
   BEFORE_SET_TOP;
 
-  jit_movi_p (JIT_V0, tree->data);
+  jit_movi (JIT_V0, (jit_word_t)tree->data);
   self_cached = false;
 }
 
 void
 gen_top_lit_var (code_tree *tree)
 {
-  char *assocOOP = ((char *) tree->data) + jit_ptr_field (OOP, object);
+  char *assocOOP = ((char *) tree->data) + offsetof (struct oop_s, object);
 
   BEFORE_SET_TOP;
 
-  jit_ldi_p (JIT_V0, assocOOP);
-  jit_ldxi_p (JIT_V0, JIT_V0, jit_ptr_field (gst_association, value));
+  jit_ldi (JIT_V0, assocOOP);
+  jit_ldxi (JIT_V0, JIT_V0, offsetof (struct gst_association, value));
   self_cached = false;
 }
 
@@ -2368,6 +2430,7 @@ void
 emit_code_tree (code_tree *tree)
 {
   int operation;
+  jit_node_t *jmp;
 
   operation = tree->operation & (TREE_OP | TREE_SUBOP);
   emit_operation_funcs[operation] (tree);
@@ -2379,49 +2442,67 @@ emit_code_tree (code_tree *tree)
       break;
 
     case TREE_EXTRA_POP:
+#if 1
+      jit_note(method_name, __LINE__);
+#endif
       POP_EXPORT_SP;
       break;
 
     case TREE_EXTRA_RETURN:
+#if 1
+      jit_note(method_name, __LINE__);
+#endif
       CACHE_STACK_TOP;
       jit_calli (PTR_UNWIND_CONTEXT);
       IMPORT_SP;
-      jit_ldi_p (JIT_R0, &native_ip);
-      jit_str_p (JIT_V2, JIT_V0);
+      jit_ldi (JIT_R0, &native_ip);
+      jit_str (JIT_V2, JIT_V0);
       jit_jmpr (JIT_R0);
       break;
 
     case TREE_EXTRA_METHOD_RET:
+#if 1
+      jit_note(method_name, __LINE__);
+#endif
       CACHE_STACK_TOP;
       jit_calli (PTR_UNWIND_METHOD);
       jit_retval (JIT_R0);
-      jit_beqi_i (bad_return_code, JIT_R0, false);
+      jmp = jit_bnei (JIT_R0, false);
+      jit_patch_abs (jit_jmpi (), bad_return_code);
+      jit_patch (jmp);
       IMPORT_SP;
-      jit_ldi_p (JIT_R0, &native_ip);
-      jit_str_p (JIT_V2, JIT_V0);
+      jit_ldi (JIT_R0, &native_ip);
+      jit_str (JIT_V2, JIT_V0);
       jit_jmpr (JIT_R0);
       break;
 
     case TREE_EXTRA_JMP_ALWAYS:
-      {
-	jit_insn *addr;
-
-	CACHE_STACK_TOP;
-	addr = lbl_get (tree->jumpDest);
-	addr = jit_jmpi (addr);
-	lbl_use (tree->jumpDest, addr);
-	break;
-      }
+#if 1
+      jit_note(method_name, __LINE__);
+#endif
+      CACHE_STACK_TOP;
+      jmp = jit_jmpi ();
+      jit_patch_at (jmp, tree->jumpDest);
+      break;
 
     case TREE_EXTRA_JMP_TRUE:
+#if 1
+      jit_note(method_name, __LINE__);
+#endif
       CONDITIONAL_JUMP (_gst_true_oop, _gst_false_oop);
       break;
 
     case TREE_EXTRA_JMP_FALSE:
+#if 1
+      jit_note(method_name, __LINE__);
+#endif
       CONDITIONAL_JUMP (_gst_false_oop, _gst_true_oop);
       break;
     }
 
+#if 1
+      jit_note(method_name, __LINE__);
+#endif
   /* Change the code_tree's operation field to TREE_ALREADY_EMITTED,
      and null the extra op. field */
   tree->operation &= TREE_CLASS_CHECKS;
@@ -2435,7 +2516,7 @@ emit_code_tree (code_tree *tree)
 void
 emit_deferred_sends (deferred_send *ds)
 {
-  jit_insn *addr;
+  jit_node_t *jmp;
   code_tree *tree;
   inline_cache *ic;
 
@@ -2448,83 +2529,98 @@ emit_deferred_sends (deferred_send *ds)
   ic = (inline_cache *) tree->data;
   assert (!ic->is_super);
 
-  lbl_define (ds->address);
+#if 1
+      jit_note(method_name, __LINE__);
+#endif
+  jit_link (ds->address);
   if (ds->reg1 == JIT_NOREG)
     {
-      jit_movi_p (JIT_R0, ds->oop);
+      jit_movi (JIT_R0, (jit_word_t)ds->oop);
       ds->reg1 = JIT_R0;
     }
 
-  jit_stxi_p (sizeof (PTR) * 1, JIT_V2, ds->reg0);
-  jit_stxi_p (sizeof (PTR) * 2, JIT_V2, ds->reg1);
-  jit_addi_p (JIT_V2, JIT_V2, sizeof (PTR) * 2);
+#if 1
+      jit_note(method_name, __LINE__);
+#endif
+  jit_stxi (sizeof (PTR) * 1, JIT_V2, ds->reg0);
+  jit_stxi (sizeof (PTR) * 2, JIT_V2, ds->reg1);
+  jit_addi (JIT_V2, JIT_V2, sizeof (PTR) * 2);
 
-  jit_movi_p (JIT_V1, ic);
-  jit_sti_p (&sp, JIT_V2);
-  jit_movi_ul (JIT_V0, tree->bp - bc);
-  jit_ldxi_p (JIT_R1, JIT_V1, jit_field (inline_cache, cachedIP));
-  jit_sti_ul (&ip, JIT_V0);
+#if 1
+      jit_note(method_name, __LINE__);
+#endif
+  jit_movi (JIT_V1, (jit_word_t)ic);
+  jit_sti (&sp, JIT_V2);
+  jit_movi (JIT_V0, (jit_word_t)(tree->bp - bc));
+  jit_ldxi (JIT_R1, JIT_V1, offsetof (inline_cache, cachedIP));
+  jit_sti (&ip, JIT_V0);
 
+#if 1
+      jit_note(method_name, __LINE__);
+#endif
   jit_jmpr (JIT_R1);
-  jit_align (2);
 
-  ic->native_ip = jit_get_label ();
+  defer_map_patch (&ic->native_ip);
   define_ip_map_entry (tree->bp - bc);
 
+#if 1
+      jit_note(method_name, __LINE__);
+#endif
   IMPORT_SP;
   if (ds->trueDest == ds->falseDest)
     {
       /* This was an arithmetic deferred send.  */
-      jit_ldr_p (JIT_V0, JIT_V2);
-      addr = lbl_get (ds->trueDest);
-      addr = jit_jmpi (addr);
-      lbl_use (ds->trueDest, addr);
+      jit_ldr (JIT_V0, JIT_V2);
+      jmp = jit_jmpi ();
+      jit_patch_at (jmp, ds->trueDest);
 
     }
   else
     {
       /* This was a boolean deferred send.  */
-      jit_ldr_p (JIT_R0, JIT_V2);
-      jit_subi_p (JIT_V2, JIT_V2, sizeof (PTR));
-      jit_ldr_p (JIT_V0, JIT_V2);
+      jit_ldr (JIT_R0, JIT_V2);
+      jit_subi (JIT_V2, JIT_V2, sizeof (PTR));
+      jit_ldr (JIT_V0, JIT_V2);
 
-      addr = lbl_get (ds->trueDest);
-      addr = jit_beqi_p (addr, JIT_R0, _gst_true_oop);
-      lbl_use (ds->trueDest, addr);
+      jmp = jit_beqi (JIT_R0, (jit_word_t)_gst_true_oop);
+      jit_patch_at (jmp, ds->trueDest);
 
-      addr = lbl_get (ds->falseDest);
-      addr = jit_beqi_p (addr, JIT_R0, _gst_false_oop);
-      lbl_use (ds->falseDest, addr);
-      jit_jmpi (non_boolean_code);
+      jmp = jit_beqi (JIT_R0, (jit_word_t)_gst_false_oop);
+      jit_patch_at (jmp, ds->falseDest);
+      jit_patch_abs (jit_jmpi (), non_boolean_code);
     }
 }
 
 void
 emit_interrupt_check (int restartReg, int ipOffset)
 {
-  jit_insn *jmp, *restart = NULL;
+  jit_node_t *jmp, *restart = NULL;
 
+#if 1
+      jit_note(method_name, __LINE__);
+#endif
   jit_ldi_i (JIT_R2, &_gst_except_flag);
-  jmp = jit_beqi_i (jit_forward (), JIT_R2, 0);
+  jmp = jit_beqi (JIT_R2, 0);
 
   /* Save the global ip pointer */
   if (ipOffset != -1)
     {
-      jit_movi_ul (JIT_R2, ipOffset);
-      jit_sti_ul (&ip, JIT_R2);
+      jit_movi (JIT_R2, ipOffset);
+      jit_sti (&ip, JIT_R2);
     }
-
-  jit_align (2);
 
   /* Where to restart?*/
   if (restartReg == JIT_NOREG)
-    restart = jit_movi_p (JIT_RET, jit_forward());
+      restart = jit_movi (JIT_R0, 0);
   else
-    jit_movr_p (JIT_RET, restartReg);
+      jit_movr (JIT_R0, restartReg);
 
-  jit_ret ();
+#if 1
+      jit_note(method_name, __LINE__);
+#endif
+  jit_patch_abs (jit_jmpi (), _gst_return_from_native_code);
   if (restart)
-    jit_patch_movi (restart, jit_get_label());
+    jit_patch (restart);
   jit_patch (jmp);
 }
 
@@ -2540,7 +2636,7 @@ emit_basic_size_in_r0 (OOP classOOP, mst_Boolean tagged, int objectReg)
 
   if (!CLASS_IS_INDEXABLE (classOOP))
     {
-      jit_movi_p (JIT_R0, FROM_INT (0));
+      jit_movi (JIT_R0, (jit_word_t)FROM_INT (0));
       return;
     }
 
@@ -2556,31 +2652,31 @@ emit_basic_size_in_r0 (OOP classOOP, mst_Boolean tagged, int objectReg)
 
   if (objectReg == JIT_NOREG)
     {
-      jit_ldxi_p (JIT_R2, JIT_V0, jit_ptr_field (OOP, object));
+      jit_ldxi (JIT_R2, JIT_V0, offsetof (struct oop_s, object));
       objectReg = JIT_R2;
     }
 
-  jit_ldxi_l (JIT_R0, objectReg, jit_ptr_field (gst_object, objSize));
+  jit_ldxi (JIT_R0, objectReg, offsetof (struct object_s, objSize));
 
   if (shape != GST_ISP_POINTER)
-    jit_ldxi_p (JIT_V1, JIT_V0, jit_ptr_field (OOP, flags));
+    jit_ldxi (JIT_V1, JIT_V0, offsetof (struct oop_s, flags));
 
   if (!tagged)
     /* Remove the tag bit */
-    jit_rshi_l (JIT_R0, JIT_R0, 1);
+    jit_rshi (JIT_R0, JIT_R0, 1);
   else
     adjust = adjust * 2;
 
   if (shape != GST_ISP_POINTER)
     {
-      jit_andi_l (JIT_V1, JIT_V1, EMPTY_BYTES);
-      jit_lshi_l (JIT_R0, JIT_R0, LONG_SHIFT);
-      jit_subr_l (JIT_R0, JIT_R0, JIT_V1);
+      jit_andi (JIT_V1, JIT_V1, EMPTY_BYTES);
+      jit_lshi (JIT_R0, JIT_R0, LONG_SHIFT);
+      jit_subr (JIT_R0, JIT_R0, JIT_V1);
 
       adjust *= sizeof (PTR);
       if (tagged)
         {
-          jit_subr_l (JIT_R0, JIT_R0, JIT_V1);
+          jit_subr (JIT_R0, JIT_R0, JIT_V1);
 
           /* Move the tag bit back to bit 0 after the long shift above */
           adjust += sizeof (PTR) - 1;
@@ -2588,7 +2684,7 @@ emit_basic_size_in_r0 (OOP classOOP, mst_Boolean tagged, int objectReg)
     }
 
   if (adjust)
-    jit_subi_l (JIT_R0, JIT_R0, adjust);
+    jit_subi (JIT_R0, JIT_R0, adjust);
 }
 
 /* This takes care of emitting the code for inlined primitives.
@@ -2600,7 +2696,7 @@ emit_inlined_primitive (int primitive, int numArgs, int attr)
     {
     case 60:
       {
-	jit_insn *fail1, *fail2;
+	jit_node_t *fail1, *fail2;
 	OOP charBase = CHAR_OOP_AT (0);
 	int numFixed = CLASS_FIXED_FIELDS (current->receiverClass) +
 	  sizeof (gst_object_header) / sizeof (PTR);
@@ -2613,7 +2709,7 @@ emit_inlined_primitive (int primitive, int numArgs, int attr)
 	if (!shape)
 	  {
 	    /* return failure */
-	    jit_movi_p (JIT_R0, -1);
+	    jit_movi (JIT_R0, -1);
 	    return PRIM_FAIL | PRIM_INLINED;
 	  }
 
@@ -2622,48 +2718,48 @@ emit_inlined_primitive (int primitive, int numArgs, int attr)
 	  /* too complicated to return LargeIntegers */
 	  break;
 
-	jit_ldi_p (JIT_R1, &sp);
+	jit_ldi (JIT_R1, &sp);
 	emit_basic_size_in_r0 (current->receiverClass, false, JIT_NOREG);
 
 	/* Point R2 to the first indexed slot */
-	jit_addi_ui (JIT_R2, JIT_R2, numFixed * sizeof (PTR));
+	jit_addi (JIT_R2, JIT_R2, numFixed * sizeof (PTR));
 
 	/* Load the index and test it: remove tag bit, then check if
 	   (unsigned) (V1 - 1) >= R0 */
 
-	jit_ldr_l (JIT_V1, JIT_R1);
-	fail1 = jit_bmci_l (jit_get_label (), JIT_V1, 1);
+	jit_ldr (JIT_V1, JIT_R1);
+	fail1 = jit_bmci (JIT_V1, 1);
 
-	jit_rshi_ul (JIT_V1, JIT_V1, 1);
-	jit_subi_ul (JIT_V1, JIT_V1, 1);
-	fail2 = jit_bger_ul (jit_get_label (), JIT_V1, JIT_R0);
+	jit_rshi_u (JIT_V1, JIT_V1, 1);
+	jit_subi (JIT_V1, JIT_V1, 1);
+	fail2 = jit_bger_u (JIT_V1, JIT_R0);
 
 	/* adjust stack top */
-	jit_subi_l (JIT_R1, JIT_R1, sizeof (PTR));
+	jit_subi (JIT_R1, JIT_R1, sizeof (PTR));
 
 	/* Now R2 + V1 << SOMETHING contains the pointer to the slot
 	   (SOMETHING depends on the shape).  */
 	switch (shape)
 	  {
 	  case GST_ISP_POINTER:
-	    jit_lshi_ul (JIT_V1, JIT_V1, LONG_SHIFT);
-	    jit_ldxr_p (JIT_R0, JIT_R2, JIT_V1);
+	    jit_lshi (JIT_V1, JIT_V1, LONG_SHIFT);
+	    jit_ldxr (JIT_R0, JIT_R2, JIT_V1);
 	    break;
 
 	  case GST_ISP_UCHAR:
 	    jit_ldxr_uc (JIT_R0, JIT_R2, JIT_V1);
 
 	    /* Tag the byte we read */
-	    jit_addr_ul (JIT_R0, JIT_R0, JIT_R0);
-	    jit_addi_ul (JIT_R0, JIT_R0, 1);
+	    jit_addr (JIT_R0, JIT_R0, JIT_R0);
+	    jit_addi (JIT_R0, JIT_R0, 1);
 	    break;
 
 	  case GST_ISP_SCHAR:
 	    jit_ldxr_c (JIT_R0, JIT_R2, JIT_V1);
 
 	    /* Tag the byte we read */
-	    jit_addr_ul (JIT_R0, JIT_R0, JIT_R0);
-	    jit_addi_ul (JIT_R0, JIT_R0, 1);
+	    jit_addr (JIT_R0, JIT_R0, JIT_R0);
+	    jit_addi (JIT_R0, JIT_R0, 1);
 	    break;
 
 	  case GST_ISP_CHARACTER:
@@ -2671,16 +2767,16 @@ emit_inlined_primitive (int primitive, int numArgs, int attr)
 	      jit_ldxr_uc (JIT_R0, JIT_R2, JIT_V1);
 
               /* Convert to a character */
-              jit_lshi_l (JIT_R0, JIT_R0, LONG_SHIFT + 1);
-              jit_addi_p (JIT_R0, JIT_R0, charBase);
+              jit_lshi (JIT_R0, JIT_R0, LONG_SHIFT + 1);
+              jit_addi (JIT_R0, JIT_R0, (jit_word_t)charBase);
 	    }
 	  }
 
 	/* Store the result and the new stack pointer */
-	jit_str_p (JIT_R1, JIT_R0);
-	jit_sti_p (&sp, JIT_R1);
+	jit_str (JIT_R1, JIT_R0);
+	jit_sti (&sp, JIT_R1);
 
-	jit_movi_l (JIT_R0, -1);
+	jit_movi (JIT_R0, -1);
 
 	jit_patch (fail1);
 	jit_patch (fail2);
@@ -2688,8 +2784,8 @@ emit_inlined_primitive (int primitive, int numArgs, int attr)
 	/* We get here with the _gst_basic_size in R0 upon failure,
 	   with -1 upon success.  We need to get 0 upon success and -1
 	   upon failure.  */
-	jit_rshi_l (JIT_R0, JIT_R0, 31);
-	jit_notr_l (JIT_R0, JIT_R0);
+	jit_rshi (JIT_R0, JIT_R0, 31);
+	jit_comr (JIT_R0, JIT_R0);
 
 	return PRIM_FAIL | PRIM_SUCCEED | PRIM_INLINED;
       }
@@ -2697,7 +2793,7 @@ emit_inlined_primitive (int primitive, int numArgs, int attr)
 
     case 61:
       {
-	jit_insn *fail0, *fail1, *fail2, *fail3, *fail4;
+	jit_node_t *fail0, *fail1, *fail2, *fail3, *fail4;
 	OOP charBase = CHAR_OOP_AT (0);
 	int numFixed = CLASS_FIXED_FIELDS (current->receiverClass) +
 	  sizeof (gst_object_header) / sizeof (PTR);
@@ -2710,7 +2806,7 @@ emit_inlined_primitive (int primitive, int numArgs, int attr)
 	if (!shape)
 	  {
 	    /* return failure */
-	    jit_movi_p (JIT_R0, -1);
+	    jit_movi (JIT_R0, -1);
 	    return PRIM_FAIL | PRIM_INLINED;
 	  }
 
@@ -2718,66 +2814,66 @@ emit_inlined_primitive (int primitive, int numArgs, int attr)
 	  /* too complicated to convert LargeIntegers */
 	  break;
 
-	jit_ldxi_ul (JIT_V1, JIT_V0, jit_ptr_field (OOP, flags));
-	fail0 = jit_bmsi_ul (jit_get_label (), JIT_V1, F_READONLY);
+	jit_ldxi (JIT_V1, JIT_V0, offsetof (struct oop_s, flags));
+	fail0 = jit_bmsi (JIT_V1, (jit_word_t)F_READONLY);
 
-	jit_ldi_p (JIT_R1, &sp);
+	jit_ldi (JIT_R1, &sp);
 	emit_basic_size_in_r0 (current->receiverClass, false, JIT_NOREG);
 
 	/* Point R2 to the first indexed slot */
-	jit_addi_ui (JIT_R2, JIT_R2, numFixed * sizeof (PTR));
+	jit_addi (JIT_R2, JIT_R2, numFixed * sizeof (PTR));
 
 	/* Load the index and test it: remove tag bit, then check if
 	   (unsigned) (V1 - 1) >= R0 */
 
-	jit_ldxi_l (JIT_V1, JIT_R1, -sizeof (PTR));
+	jit_ldxi (JIT_V1, JIT_R1, -(int)sizeof (PTR));
 
-	fail1 = jit_bmci_l (jit_get_label (), JIT_V1, 1);
+	fail1 = jit_bmci (JIT_V1, 1);
 
-	jit_rshi_ul (JIT_V1, JIT_V1, 1);
-	jit_subi_ul (JIT_V1, JIT_V1, 1);
-	fail2 = jit_bger_ul (jit_get_label (), JIT_V1, JIT_R0);
+	jit_rshi_u (JIT_V1, JIT_V1, 1);
+	jit_subi (JIT_V1, JIT_V1, 1);
+	fail2 = jit_bger_u (JIT_V1, JIT_R0);
 
 	if (shape == GST_ISP_POINTER)
-	  jit_lshi_ul (JIT_V1, JIT_V1, LONG_SHIFT);
+	  jit_lshi (JIT_V1, JIT_V1, LONG_SHIFT);
 
 	/* Compute the effective address to free V1 for the operand */
-	jit_addr_l (JIT_R2, JIT_R2, JIT_V1);
-	jit_ldr_l (JIT_V1, JIT_R1);
+	jit_addr (JIT_R2, JIT_R2, JIT_V1);
+	jit_ldr (JIT_V1, JIT_R1);
 
 	switch (shape)
 	  {
 	  case GST_ISP_UCHAR:
 	    /* Check and untag the byte we store */
-	    fail3 = jit_bmci_l (jit_get_label (), JIT_V1, 1);
-	    jit_rshi_ul (JIT_R0, JIT_V1, 1);
-	    fail4 = jit_bmsi_ul (jit_get_label (), JIT_R0, ~255);
+	    fail3 = jit_bmci (JIT_V1, 1);
+	    jit_rshi_u (JIT_R0, JIT_V1, 1);
+	    fail4 = jit_bmsi (JIT_R0, ~255);
 
-	    jit_str_uc (JIT_R2, JIT_R0);
+	    jit_str_c (JIT_R2, JIT_R0);
 	    break;
 
 	  case GST_ISP_CHARACTER:
 	    /* Check the character we store */
-	    fail3 = jit_bmsi_l (jit_get_label (), JIT_V1, 1);
+	    fail3 = jit_bmsi (JIT_V1, 1);
 
-	    jit_subi_p (JIT_R0, JIT_V1, charBase);
-	    jit_rshi_ul (JIT_R0, JIT_R0, LONG_SHIFT + 1);
-	    fail4 = jit_bmsi_ul (jit_get_label (), JIT_R0, ~255);
+	    jit_subi (JIT_R0, JIT_V1, (jit_word_t)charBase);
+	    jit_rshi_u (JIT_R0, JIT_R0, LONG_SHIFT + 1);
+	    fail4 = jit_bmsi (JIT_R0, ~255);
 
-	    jit_str_uc (JIT_R2, JIT_R0);
+	    jit_str_c (JIT_R2, JIT_R0);
 	    break;
 
 	  case GST_ISP_POINTER:
 	    fail3 = fail4 = NULL;
-	    jit_str_p (JIT_R2, JIT_V1);
+	    jit_str (JIT_R2, JIT_V1);
 	  }
 
 	/* Store the result and the new stack pointer */
-	jit_subi_l (JIT_R1, JIT_R1, sizeof (PTR) * 2);
-	jit_str_p (JIT_R1, JIT_V1);
-	jit_sti_p (&sp, JIT_R1);
+	jit_subi (JIT_R1, JIT_R1, sizeof (PTR) * 2);
+	jit_str (JIT_R1, JIT_V1);
+	jit_sti (&sp, JIT_R1);
 
-	jit_movi_l (JIT_R0, -1);
+	jit_movi (JIT_R0, -1);
 
 	jit_patch (fail0);
 	jit_patch (fail1);
@@ -2791,8 +2887,8 @@ emit_inlined_primitive (int primitive, int numArgs, int attr)
 	/* We get here with the _gst_basic_size in R0 upon failure,
 	   with -1 upon success.  We need to get 0 upon success and -1
 	   upon failure.  */
-	jit_rshi_l (JIT_R0, JIT_R0, 31);
-	jit_notr_l (JIT_R0, JIT_R0);
+	jit_rshi (JIT_R0, JIT_R0, 31);
+	jit_comr (JIT_R0, JIT_R0);
 
 	return PRIM_FAIL | PRIM_SUCCEED | PRIM_INLINED;
       }
@@ -2809,9 +2905,9 @@ emit_inlined_primitive (int primitive, int numArgs, int attr)
 	  /* too complicated to convert LargeIntegers */
 	  break;
 
-        jit_ldi_p (JIT_R1, &sp);
+        jit_ldi (JIT_R1, &sp);
         emit_basic_size_in_r0 (current->receiverClass, true, JIT_NOREG);
-        jit_str_p (JIT_R1, JIT_R0);
+        jit_str (JIT_R1, JIT_R0);
         return (PRIM_SUCCEED | PRIM_INLINED);
       }
 
@@ -2829,23 +2925,23 @@ emit_inlined_primitive (int primitive, int numArgs, int attr)
 	if (CLASS_IS_INDEXABLE (class_oop))
 	  {
 	    /* return failure */
-	    jit_movi_p (JIT_R0, -1);
+	    jit_movi (JIT_R0, -1);
 	    return PRIM_FAIL | PRIM_INLINED;
 	  }
 
 	/* SET_STACKTOP (alloc_oop (instantiate (_gst_self))) */
-	jit_prepare (1);
-	jit_pusharg_p (JIT_V0);
-	jit_finish (instantiate);
+	jit_prepare ();
+	jit_pushargr (JIT_V0);
+	jit_finishi (instantiate);
 	jit_retval (JIT_R0);
 
-	jit_prepare (1);
-	jit_pusharg_p (JIT_R0);
-	jit_finish (alloc_oop);
+	jit_prepare ();
+	jit_pushargr (JIT_R0);
+	jit_finishi (alloc_oop);
 
-	jit_ldi_p (JIT_V1, &sp);
 	jit_retval (JIT_R0);
-	jit_str_p (JIT_V1, JIT_R0);
+	jit_ldi (JIT_V1, &sp);
+	jit_str (JIT_V1, JIT_R0);
 	return (PRIM_SUCCEED | PRIM_INLINED);
       }
 
@@ -2853,7 +2949,7 @@ emit_inlined_primitive (int primitive, int numArgs, int attr)
     case 71:
       {
 	OOP class_oop;
-	jit_insn *fail1, *fail2;
+	jit_node_t *fail1, *fail2;
 
 	if (numArgs != 1)
 	  break;
@@ -2865,33 +2961,33 @@ emit_inlined_primitive (int primitive, int numArgs, int attr)
 	if (!CLASS_IS_INDEXABLE (class_oop))
 	  {
 	    /* return failure */
-	    jit_movi_p (JIT_R0, -1);
+	    jit_movi (JIT_R0, -1);
 	    return PRIM_FAIL | PRIM_INLINED;
 	  }
 
-	jit_ldi_p (JIT_V1, &sp);
-	jit_ldr_p (JIT_R1, JIT_V1);	/* load the argument */
-	jit_movi_i (JIT_R0, -1);	/* failure */
+	jit_ldi (JIT_V1, &sp);
+	jit_ldr (JIT_R1, JIT_V1);	/* load the argument */
+	jit_movi (JIT_R0, -1);	/* failure */
 
-	fail2 = jit_bmci_l (jit_get_label (), JIT_R1, 1);
-	fail1 = jit_blti_p (jit_get_label (), JIT_R1, FROM_INT (0));
+	fail2 = jit_bmci (JIT_R1, 1);
+	fail1 = jit_blti (JIT_R1, FROM_INT (0));
 
-	jit_rshi_l (JIT_R1, JIT_R1, 1);	/* clear tag bit */
-	jit_subi_l (JIT_V1, JIT_V1, sizeof (PTR));	/* set new
+	jit_rshi (JIT_R1, JIT_R1, 1);	/* clear tag bit */
+	jit_subi (JIT_V1, JIT_V1, sizeof (PTR));	/* set new
 							   stack top */
 
 	/* SET_STACKTOP (instantiate_oopwith (_gst_self, POP_OOP())) */
-	jit_prepare (2);
-	jit_pusharg_p (JIT_R1);
-	jit_pusharg_p (JIT_V0);
-	jit_finish (instantiate_oopwith);
+	jit_prepare ();
+	jit_pushargr (JIT_V0);
+	jit_pushargr (JIT_R1);
+	jit_finishi (instantiate_oopwith);
 	jit_retval (JIT_R0);
 
 	/* Store the result and the new stack pointer */
-	jit_str_p (JIT_V1, JIT_R0);
-	jit_sti_p (&sp, JIT_V1);
+	jit_str (JIT_V1, JIT_R0);
+	jit_sti (&sp, JIT_V1);
 
-	jit_movi_i (JIT_R0, 0);	/* success */
+	jit_movi (JIT_R0, 0);	/* success */
 
 	jit_patch (fail2);
 	jit_patch (fail1);
@@ -2904,37 +3000,37 @@ emit_inlined_primitive (int primitive, int numArgs, int attr)
       if (numArgs != 1)
 	break;
 
-      jit_ldi_p (JIT_V1, &sp);
-      jit_ldr_p (JIT_R1, JIT_V1);	/* load the argument */
-      jit_ner_p (JIT_R0, JIT_R1, JIT_V0);
+      jit_ldi (JIT_V1, &sp);
+      jit_ldr (JIT_R1, JIT_V1);	/* load the argument */
+      jit_ner (JIT_R0, JIT_R1, JIT_V0);
 
-      jit_subi_l (JIT_V1, JIT_V1, sizeof (PTR));	/* set new stack top */
-      jit_lshi_i (JIT_V0, JIT_R0, LONG_SHIFT + 1);
-      jit_movi_i (JIT_R0, 0);	/* success */
-      jit_addi_p (JIT_V0, JIT_V0, _gst_true_oop);
+      jit_subi (JIT_V1, JIT_V1, sizeof (PTR));	/* set new stack top */
+      jit_lshi (JIT_V0, JIT_R0, LONG_SHIFT + 1);
+      jit_movi (JIT_R0, 0);	/* success */
+      jit_addi (JIT_V0, JIT_V0, (jit_word_t)_gst_true_oop);
 
       /* Store the result and the new stack pointer */
-      jit_str_p (JIT_V1, JIT_V0);
-      jit_sti_p (&sp, JIT_V1);
+      jit_str (JIT_V1, JIT_V0);
+      jit_sti (&sp, JIT_V1);
 
       return (PRIM_SUCCEED | PRIM_INLINED);
 
     case 111:
       {
-	jit_insn *jmp;
+	jit_node_t *jmp;
         if (numArgs != 0)
 	  break;
 
-        jit_ldi_p (JIT_V1, &sp);
-        jit_movi_p (JIT_R0, _gst_small_integer_class);
-        jmp = jit_bmsi_ul (jit_forward (), JIT_V0, 1);
-        jit_ldxi_p (JIT_R0, JIT_V0, jit_ptr_field (OOP, object));
-        jit_ldxi_p (JIT_R0, JIT_R0, jit_ptr_field (gst_object, objClass));
+        jit_ldi (JIT_V1, &sp);
+	jit_movi (JIT_R0, (jit_word_t)_gst_small_integer_class);
+        jmp = jit_bmsi (JIT_V0, 1);
+        jit_ldxi (JIT_R0, JIT_V0, offsetof (struct oop_s, object));
+        jit_ldxi (JIT_R0, JIT_R0, offsetof (struct object_s, objClass));
         jit_patch (jmp);
 
         /* Store the result and the new stack pointer */
-        jit_movi_i (JIT_R0, 0);	/* success */
-        jit_str_p (JIT_V1, JIT_V0);
+        jit_movi (JIT_R0, 0);	/* success */
+        jit_str (JIT_V1, JIT_V0);
 
         return (PRIM_SUCCEED | PRIM_INLINED);
       }
@@ -2947,7 +3043,7 @@ mst_Boolean
 emit_primitive (int primitive, int numArgs)
 {
   /* primitive */
-  jit_insn *fail, *succeed;
+  jit_node_t *fail, *succeed;
   prim_table_entry *pte = _gst_get_primitive_attributes (primitive);
   int attr = pte->attributes;
 
@@ -2956,29 +3052,29 @@ emit_primitive (int primitive, int numArgs)
 
   if (!(attr & PRIM_INLINED))
     {
-      jit_prepare (2);
-      jit_movi_p (JIT_R1, numArgs);
-      jit_movi_p (JIT_R2, pte->id);
-      jit_pusharg_i (JIT_R1);
-      jit_pusharg_i (JIT_R2);
-      jit_finish (pte->func);
+      jit_movi (JIT_R1, numArgs);
+      jit_movi (JIT_R2, pte->id);
+      jit_prepare ();
+      jit_pushargr (JIT_R2);
+      jit_pushargr (JIT_R1);
+      jit_finishi (pte->func);
       jit_retval (JIT_R0);
     }
 
   fail = ((attr & PRIM_FAIL)
 	  && (attr & (PRIM_SUCCEED | PRIM_RELOAD_IP))) ?
-    jit_beqi_i (jit_forward (), JIT_R0, -1) : NULL;
+    jit_beqi (JIT_R0, -1) : NULL;
 
   if (attr & PRIM_RELOAD_IP)
     {
       succeed = (attr & PRIM_SUCCEED)
-	? jit_beqi_i (jit_forward (), JIT_R0, 0) : NULL;
+	? jit_beqi (JIT_R0, 0) : NULL;
 
       /* BlockClosure>>#value saves the native code's IP in the inline cache */
       if (attr & PRIM_CACHE_NEW_IP)
-	jit_stxi_p (jit_field (inline_cache, cachedIP), JIT_V1, JIT_R0);
+	jit_stxi (offsetof (inline_cache, cachedIP), JIT_V1, JIT_R0);
 
-      jit_movr_p (JIT_V2, JIT_R0);
+      jit_movr (JIT_V2, JIT_R0);
 
       if (succeed)
 	jit_patch (succeed);
@@ -3002,12 +3098,12 @@ emit_context_setup (int numArgs, int numTemps)
   if (numArgs > 3 || numTemps > 3)
     {
       /* Call through a loop written in C */
-      jit_movi_i (JIT_V1, numTemps);
-      jit_prepare (3);
-      jit_pusharg_p (JIT_V1);	/* numTemps */
-      jit_pusharg_p (JIT_V2);	/* numArgs */
-      jit_pusharg_p (JIT_R0);	/* newContext */
-      jit_finish (PTR_PREPARE_CONTEXT);
+      jit_movi (JIT_V1, numTemps);
+      jit_prepare ();
+      jit_pushargr (JIT_R0);	/* newContext */
+      jit_pushargr (JIT_V2);	/* numArgs */
+      jit_pushargr (JIT_V1);	/* numTemps */
+      jit_finishi (PTR_PREPARE_CONTEXT);
       IMPORT_SP;
       return;
     }
@@ -3022,31 +3118,31 @@ emit_context_setup (int numArgs, int numTemps)
       switch (numArgs)
 	{
 	case 3:
-	  jit_ldxi_p (JIT_V0, JIT_V2, -2 * sizeof (PTR));
+	  jit_ldxi (JIT_V0, JIT_V2, -2 * sizeof (PTR));
 	case 2:
-	  jit_ldxi_p (JIT_R2, JIT_V2, -1 * sizeof (PTR));
+	  jit_ldxi (JIT_R2, JIT_V2, -1 * sizeof (PTR));
 	case 1:
-	  jit_ldr_p (JIT_R1, JIT_V2);
+	  jit_ldr (JIT_R1, JIT_V2);
 	case 0:
 	  break;
 	}
       if (numTemps)
-	jit_movi_p (JIT_V1, _gst_nil_oop);
+	jit_movi (JIT_V1, (jit_word_t)_gst_nil_oop);
 
-      jit_addi_p (JIT_V2, JIT_R0,
-		  jit_ptr_field (gst_method_context, contextStack));
-      jit_sti_p (&_gst_temporaries, JIT_V2);
+      jit_addi (JIT_V2, JIT_R0,
+		offsetof (struct gst_method_context, contextStack));
+      jit_sti (&_gst_temporaries, JIT_V2);
       ofs = 0;
       switch (numArgs)
 	{
 	case 3:
-	  jit_stxi_p (ofs, JIT_V2, JIT_V0);
+	  jit_stxi (ofs, JIT_V2, JIT_V0);
 	  ofs += sizeof (PTR);
 	case 2:
-	  jit_stxi_p (ofs, JIT_V2, JIT_R2);
+	  jit_stxi (ofs, JIT_V2, JIT_R2);
 	  ofs += sizeof (PTR);
 	case 1:
-	  jit_stxi_p (ofs, JIT_V2, JIT_R1);
+	  jit_stxi (ofs, JIT_V2, JIT_R1);
 	  ofs += sizeof (PTR);
 	case 0:
 	  break;
@@ -3054,26 +3150,26 @@ emit_context_setup (int numArgs, int numTemps)
       switch (numTemps)
 	{
 	case 3:
-	  jit_stxi_p (ofs, JIT_V2, JIT_V1);
+	  jit_stxi (ofs, JIT_V2, JIT_V1);
 	  ofs += sizeof (PTR);
 	case 2:
-	  jit_stxi_p (ofs, JIT_V2, JIT_V1);
+	  jit_stxi (ofs, JIT_V2, JIT_V1);
 	  ofs += sizeof (PTR);
 	case 1:
-	  jit_stxi_p (ofs, JIT_V2, JIT_V1);
+	  jit_stxi (ofs, JIT_V2, JIT_V1);
 	  ofs += sizeof (PTR);
 	case 0:
 	  break;
 	}
 
-      jit_addi_p (JIT_V2, JIT_V2, ofs - sizeof (PTR));
+      jit_addi (JIT_V2, JIT_V2, ofs - sizeof (PTR));
     }
   else
     {
-      jit_addi_p (JIT_V2, JIT_R0,
-		  jit_ptr_field (gst_method_context, contextStack[-1]));
+      jit_addi (JIT_V2, JIT_R0,
+		offsetof (struct gst_method_context, contextStack) - sizeof (OOP));
     }
-  jit_sti_p (&sp, JIT_V2);
+  jit_sti (&sp, JIT_V2);
 }
 
 void
@@ -3127,6 +3223,7 @@ mst_Boolean
 emit_method_prolog (OOP methodOOP,
 		    gst_compiled_method method)
 {
+  jit_node_t *jmp, *out;
   method_header header;
   int flag, stack_depth;
   OOP receiverClass;
@@ -3135,6 +3232,9 @@ emit_method_prolog (OOP methodOOP,
   flag = header.headerFlag;
   receiverClass = current->receiverClass;
 
+#if 1
+  jit_note (method_name, __LINE__);
+#endif
   if (flag == MTH_USER_DEFINED)
     /* Include enough stack slots for the arguments, the first
        two parameters of #valueWithReceiver:withArguments:,
@@ -3145,36 +3245,51 @@ emit_method_prolog (OOP methodOOP,
     stack_depth = header.stack_depth;
 
 
-  jit_ldxi_p (JIT_V0, JIT_V2, sizeof (PTR) * -header.numArgs);
+  jit_ldxi (JIT_V0, JIT_V2, sizeof (PTR) * -header.numArgs);
   if (receiverClass == _gst_small_integer_class)
-    jit_bmci_ul (do_send_code, JIT_V0, 1);
-
+    out = jit_bmsi (JIT_V0, 1);
   else
     {
-      jit_bmsi_ul (do_send_code, JIT_V0, 1);
-      jit_ldxi_p (JIT_R2, JIT_V0, jit_ptr_field (OOP, object));
-      jit_ldxi_p (JIT_R1, JIT_R2, jit_ptr_field (gst_object, objClass));
-      jit_bnei_p (do_send_code, JIT_R1, receiverClass);
+      jmp = jit_bmsi (JIT_V0, 1);
+      jit_ldxi (JIT_R2, JIT_V0, offsetof (struct oop_s, object));
+      jit_ldxi (JIT_R1, JIT_R2, offsetof (struct object_s, objClass));
+      out = jit_beqi (JIT_R1, (jit_word_t)receiverClass);
+      jit_patch (jmp);
     }
+  jit_patch_abs (jit_jmpi (), do_send_code);
+  jit_patch (out);
 
   /* Mark the translation as used *before* a GC can be triggered.  */
-  jit_ldi_ul (JIT_R0, &(methodOOP->flags));
-  jit_ori_ul (JIT_R0, JIT_R0, F_XLAT_REACHABLE);
-  jit_sti_ul (&(methodOOP->flags), JIT_R0);
+  jit_ldi (JIT_R0, &(methodOOP->flags));
+  jit_ori (JIT_R0, JIT_R0, F_XLAT_REACHABLE);
+  jit_sti (&(methodOOP->flags), JIT_R0);
 
   switch (flag)
     {
     case MTH_RETURN_SELF:
-      jit_ldxi_p (JIT_V1, JIT_V1, jit_field (inline_cache, native_ip));
+#if 1
+  jit_note (method_name, __LINE__);
+#endif
+      jit_ldxi (JIT_V1, JIT_V1, offsetof (inline_cache, native_ip));
       jit_jmpr (JIT_V1);
       return (true);
 
     case MTH_RETURN_INSTVAR:
       {
-	int ofs = jit_ptr_field (gst_object, data[header.primitiveIndex]);
-	jit_ldxi_p (JIT_V1, JIT_V1, jit_field (inline_cache, native_ip));
-	jit_ldxi_p (JIT_R2, JIT_R2, ofs);	/* Remember? R2 is _gst_self->object */
-	jit_str_p (JIT_V2, JIT_R2);	/* Make it the stack top */
+	int ofs = offsetof (struct object_s, data)
+	  + (header.primitiveIndex * sizeof (OOP));
+	jit_ldxi (JIT_V1, JIT_V1, offsetof (inline_cache, native_ip));
+
+	/* Reload R2 because after an indirect jump lightning 2
+	 * considers non callee save registers as dead (R2 could
+	 * have been used as a temporary). */
+#if 1
+  jit_note ("Remember3", __LINE__);
+#endif
+	jit_ldxi (JIT_R2, JIT_V0, offsetof (struct oop_s, object));
+	jit_ldxi (JIT_R2, JIT_R2, ofs);	/* R2 is _gst_self->object */
+
+	jit_str (JIT_V2, JIT_R2);	/* Make it the stack top */
 	jit_jmpr (JIT_V1);
 	return (true);
       }
@@ -3182,9 +3297,12 @@ emit_method_prolog (OOP methodOOP,
     case MTH_RETURN_LITERAL:
       {
 	OOP literal = OOP_TO_OBJ (method->literals)->data[header.primitiveIndex];
-	jit_ldxi_p (JIT_V1, JIT_V1, jit_field (inline_cache, native_ip));
-	jit_movi_p (JIT_R2, literal);
-	jit_str_p (JIT_V2, JIT_R2);	/* Make it the stack top */
+#if 1
+  jit_note (method_name, __LINE__);
+#endif
+	jit_ldxi (JIT_V1, JIT_V1, offsetof (inline_cache, native_ip));
+	jit_movi (JIT_R2, (jit_word_t)literal);
+	jit_str (JIT_V2, JIT_R2);	/* Make it the stack top */
 	jit_jmpr (JIT_V1);
 	return (true);
       }
@@ -3193,39 +3311,57 @@ emit_method_prolog (OOP methodOOP,
       break;
     }
 
-  jit_ldxi_p (JIT_V2, JIT_V1, jit_field (inline_cache, native_ip));
+#if 1
+  jit_note (method_name, __LINE__);
+#endif
+  jit_ldxi (JIT_V2, JIT_V1, offsetof (inline_cache, native_ip));
 
   if (flag == MTH_PRIMITIVE)
     if (emit_primitive (header.primitiveIndex, header.numArgs))
       return (true);
 
   /* Save the return IP */
-  jit_ldi_p (JIT_R0, &_gst_this_context_oop);
-  jit_ldxi_p (JIT_R0, JIT_R0, jit_ptr_field (OOP, object));
-  jit_addi_p (JIT_V2, JIT_V2, 1);
-  jit_stxi_p (jit_ptr_field (gst_method_context, native_ip), JIT_R0,
-	      JIT_V2);
+#if 1
+  jit_note (method_name, __LINE__);
+#endif
+  jit_ldi (JIT_R0, &_gst_this_context_oop);
+  jit_ldxi (JIT_R0, JIT_R0, offsetof (struct oop_s, object));
+  jit_addi (JIT_V2, JIT_V2, 1);
+  jit_stxi (offsetof (struct gst_method_context, native_ip), JIT_R0,
+	    JIT_V2);
 
   /* Prepare new state */
-  jit_movi_i (JIT_R0, stack_depth);
-  jit_movi_i (JIT_V2, header.numArgs);
-  jit_prepare (2);
-  jit_pusharg_p (JIT_V2);
-  jit_pusharg_p (JIT_R0);
-  jit_finish (PTR_ACTIVATE_NEW_CONTEXT);
+#if 1
+  jit_note (method_name, __LINE__);
+#endif
+  jit_movi (JIT_R0, stack_depth);
+  jit_movi (JIT_V2, header.numArgs);
+  jit_prepare ();
+  jit_pushargr (JIT_R0);
+  jit_pushargr (JIT_V2);
+  jit_finishi (PTR_ACTIVATE_NEW_CONTEXT);
   jit_retval (JIT_R0);
 
   /* Remember? V0 was loaded with _gst_self for the inline cache test */
-  jit_sti_p (&_gst_self, JIT_V0);
+#if 1
+  jit_note ("Remember0", __LINE__);
+#endif
+  jit_sti (&_gst_self, JIT_V0);
 
   /* Set the new context's flags, and _gst_this_method */
-  jit_movi_p (JIT_V0, current->methodOOP);
-  jit_movi_l (JIT_V1, MCF_IS_METHOD_CONTEXT);
-  jit_sti_p (&_gst_this_method, JIT_V0);
-  jit_stxi_p (jit_ptr_field (gst_method_context, flags), JIT_R0,
-	      JIT_V1);
+#if 1
+  jit_note (method_name, __LINE__);
+#endif
+  jit_movi (JIT_V0, (jit_word_t)current->methodOOP);
+  jit_movi (JIT_V1, (jit_word_t)MCF_IS_METHOD_CONTEXT);
+  jit_sti (&_gst_this_method, JIT_V0);
+  jit_stxi (offsetof (struct gst_method_context, flags), JIT_R0,
+	    JIT_V1);
 
   /* Move the arguments and nil the temporaries */
+#if 1
+  jit_note (method_name, __LINE__);
+#endif
   emit_context_setup (header.numArgs, header.numTemps);
 
   define_ip_map_entry (0);
@@ -3250,88 +3386,103 @@ emit_block_prolog (OOP blockOOP,
 {
   block_header header;
   OOP receiverClass;
-  jit_insn *x;
+  jit_node_t *jmp, *out, *send;
 
   header = block->header;
   receiverClass = current->receiverClass;
 
   /* Check if the number of arguments matches ours */
-  jit_ldxi_uc (JIT_R2, JIT_V1, jit_field (inline_cache, numArgs));
-  x = jit_beqi_ui (jit_forward (), JIT_R2, header.numArgs);
+  jit_ldxi_uc (JIT_R2, JIT_V1, offsetof (inline_cache, numArgs));
+  out = jit_beqi (JIT_R2, header.numArgs);
 
   /* If they don't, check if we came here because somebody called
      send_block_value.  In this case, the number of arguments is surely 
      valid and the inline cache's numArgs is bogus. This handles
      #valueWithArguments:, #primCompile:ifError: and other primitives 
      in which send_block_value is used.  */
-  jit_ldi_p (JIT_R2, &native_ip);
-  jit_bnei_p (do_send_code, JIT_R2, current->nativeCode);
-  jit_patch (x);
+  jit_ldi (JIT_R2, &native_ip);
+  jmp = jit_movi (JIT_R0, 0);
+  jit_patch_at (jmp, native_code_label);
+  jmp = jit_beqr (JIT_R2, JIT_R0);
+  send = jit_forward ();
+  jit_patch_at (jmp, send);
+  jit_patch (out);
 
   /* Check if a block evaluation was indeed requested, and if the
      BlockClosure really points to this CompiledBlock */
-  jit_ldxi_p (JIT_R1, JIT_V2, sizeof (PTR) * -header.numArgs);
-  jit_bmsi_ul (do_send_code, JIT_R1, 1);
-  jit_ldxi_p (JIT_R1, JIT_R1, jit_ptr_field (OOP, object));
-  jit_ldxi_p (JIT_R0, JIT_R1, jit_ptr_field (gst_object, objClass));
-  jit_ldxi_p (JIT_R2, JIT_R1, jit_ptr_field (gst_block_closure, block));
-  jit_bnei_p (do_send_code, JIT_R0, _gst_block_closure_class);
-  jit_bnei_p (do_send_code, JIT_R2, current->methodOOP);
+  jit_ldxi (JIT_R1, JIT_V2, sizeof (PTR) * -header.numArgs);
+  jmp = jit_bmsi (JIT_R1, 1);
+  jit_patch_at (jmp, send);
+  jit_ldxi (JIT_R1, JIT_R1, offsetof (struct oop_s, object));
+  jit_ldxi (JIT_R0, JIT_R1, offsetof (struct object_s, objClass));
+  jit_ldxi (JIT_R2, JIT_R1, offsetof (struct gst_block_closure, block));
+  jmp = jit_bnei (JIT_R0, (jit_word_t)_gst_block_closure_class);
+  jit_patch_at (jmp, send);
+  out = jit_beqi (JIT_R2, (jit_word_t)current->methodOOP);
+  jit_link (send);
+  jit_patch_abs (jit_jmpi (), do_send_code);
+  jit_patch (out);
 
   /* Now, the standard class check.  Always load _gst_self, but don't
      check the receiver's class for clean blocks.  */
-  jit_ldxi_p (JIT_V0, JIT_R1,
-	      jit_ptr_field (gst_block_closure, receiver));
+  jit_ldxi (JIT_V0, JIT_R1,
+	    offsetof (struct gst_block_closure, receiver));
   if (block->header.clean != 0)
     {
       if (receiverClass == _gst_small_integer_class)
-	{
-	  jit_bmci_ul (do_send_code, JIT_V0, 1);
-	}
+        {
+	  out = jit_bmsi (JIT_V0, 1);
+        }
       else
 	{
-	  jit_bmsi_ul (do_send_code, JIT_V0, 1);
-	  jit_ldxi_p (JIT_R0, JIT_V0, jit_ptr_field (OOP, object));
-	  jit_ldxi_p (JIT_R0, JIT_R0,
-		      jit_ptr_field (gst_object, objClass));
-	  jit_bnei_p (do_send_code, JIT_R0, receiverClass);
+	  jmp = jit_bmsi (JIT_V0, 1);
+	  jit_ldxi (JIT_R0, JIT_V0, offsetof (struct oop_s, object));
+	  jit_ldxi (JIT_R0, JIT_R0,
+		    offsetof (struct object_s, objClass));
+	  out = jit_beqi (JIT_R0, (jit_word_t)receiverClass);
+	  jit_patch (jmp);
 	}
+      jit_patch_abs (jit_jmpi (), do_send_code);
+      jit_patch (out);
     }
 
   /* Mark the translation as used *before* a GC can be triggered.  */
-  jit_ldi_ul (JIT_R0, &(blockOOP->flags));
-  jit_ori_ul (JIT_R0, JIT_R0, F_XLAT_REACHABLE);
-  jit_sti_ul (&(blockOOP->flags), JIT_R0);
+  jit_ldi (JIT_R0, &(blockOOP->flags));
+  jit_ori (JIT_R0, JIT_R0, F_XLAT_REACHABLE);
+  jit_sti (&(blockOOP->flags), JIT_R0);
 
   /* All tests passed.  Now save the return IP */
-  jit_ldxi_p (JIT_V2, JIT_V1, jit_field (inline_cache, native_ip));
-  jit_ldi_p (JIT_R0, &_gst_this_context_oop);
-  jit_ldxi_p (JIT_R0, JIT_R0, jit_ptr_field (OOP, object));
-  jit_addi_p (JIT_V2, JIT_V2, 1);
-  jit_stxi_p (jit_ptr_field (gst_method_context, native_ip), JIT_R0,
-	      JIT_V2);
+  jit_ldxi (JIT_V2, JIT_V1, offsetof (inline_cache, native_ip));
+  jit_ldi (JIT_R0, &_gst_this_context_oop);
+  jit_ldxi (JIT_R0, JIT_R0, offsetof (struct oop_s, object));
+  jit_addi (JIT_V2, JIT_V2, 1);
+  jit_stxi (offsetof (struct gst_method_context, native_ip), JIT_R0,
+	    JIT_V2);
 
   /* Get the outer context in a callee-preserved register...  */
-  jit_ldxi_p (JIT_V1, JIT_R1,
-	      jit_ptr_field (gst_block_closure, outerContext));
+  jit_ldxi (JIT_V1, JIT_R1,
+	    offsetof (struct gst_block_closure, outerContext));
 
   /* prepare new state */
-  jit_movi_i (JIT_R0, header.depth);
-  jit_movi_i (JIT_V2, header.numArgs);
-  jit_prepare (2);
-  jit_pusharg_p (JIT_V2);
-  jit_pusharg_p (JIT_R0);
-  jit_finish (PTR_ACTIVATE_NEW_CONTEXT);
+  jit_movi (JIT_R0, header.depth);
+  jit_movi (JIT_V2, header.numArgs);
+  jit_prepare ();
+  jit_pushargr (JIT_R0);
+  jit_pushargr (JIT_V2);
+  jit_finishi (PTR_ACTIVATE_NEW_CONTEXT);
   jit_retval (JIT_R0);
 
   /* Remember? V0 was loaded with _gst_self for the inline cache test.
      Also initialize _gst_this_method and the pointer to the
      outerContext.  */
-  jit_movi_p (JIT_R1, current->methodOOP);
-  jit_sti_p (&_gst_self, JIT_V0);
-  jit_sti_p (&_gst_this_method, JIT_R1);
-  jit_stxi_p (jit_ptr_field (gst_block_context, outerContext), JIT_R0,
-	      JIT_V1);
+  jit_movi (JIT_R1, (jit_word_t)current->methodOOP);
+#if 1
+  jit_note("Remember1", __LINE__);
+#endif
+  jit_sti (&_gst_self, JIT_V0);
+  jit_sti (&_gst_this_method, JIT_R1);
+  jit_stxi (offsetof (struct gst_block_context, outerContext), JIT_R0,
+	    JIT_V1);
 
   /* Move the arguments and nil the temporaries */
   emit_context_setup (header.numArgs, header.numTemps);
@@ -3584,7 +3735,7 @@ translate_method (OOP methodOOP, OOP receiverClass, int size)
 
   rec_var_cached = self_cached = false;
   stack_cached = -1;
-  sp_delta = -sizeof (PTR);
+  sp_delta = -(int)sizeof (PTR);
   deferred_head = NULL;
   method_class = GET_METHOD_CLASS (methodOOP);
   bc = GET_METHOD_BYTECODES (methodOOP);
@@ -3598,7 +3749,7 @@ translate_method (OOP methodOOP, OOP receiverClass, int size)
     self_class_check = TREE_IS_NOT_INTEGER;
 
   /* Emit the prolog of the compiled code.  */
-  jit_ldi_p (JIT_V2, &sp);
+  jit_ldi (JIT_V2, &sp);
   if (OOP_CLASS (methodOOP) == _gst_compiled_block_class)
     {
       if (emit_block_prolog
@@ -3645,7 +3796,7 @@ translate_method (OOP methodOOP, OOP receiverClass, int size)
     }
 
   stackPos = alloca ((1 + size) * sizeof (code_stack_pointer *));
-  labels = alloca ((1 + size) * sizeof (label *));
+  labels = alloca ((1 + size) * sizeof (jit_node_t *));
   destinations = (char *) labels;
 
   _gst_compute_stack_positions (bc, size, (PTR *) t_stack, (PTR **) stackPos);
@@ -3653,7 +3804,7 @@ translate_method (OOP methodOOP, OOP receiverClass, int size)
 
   /* Create labels for bytecodes on which a jump lands */
   for (i = size; --i >= 0;)
-    labels[i] = destinations[i] ? lbl_new () : NULL;
+    labels[i] = destinations[i] ? jit_forward () : NULL;
 
   /* Now, go through the main translation loop */
   for (bp = bc, this_label = labels; bp < end; )
@@ -3683,7 +3834,8 @@ translate_method (OOP methodOOP, OOP receiverClass, int size)
 	     backward jump.  A backward jump could be used to code an
 	     infinite loop such as `[] repeat', so we test
 	     _gst_except_flag here.  */
-	  if (!lbl_define (*this_label))
+	  jit_link (*this_label);
+	  if (!jit_target_p (*this_label))
 	    {
 	      define_ip_map_entry (bp - bc);
 	      emit_interrupt_check (JIT_NOREG, bp - bc);
@@ -3740,12 +3892,12 @@ _gst_map_virtual_ip (OOP methodOOP, OOP receiverClass, int ip)
 }
 
 PTR
-_gst_get_native_code (OOP methodOOP, OOP receiverClass)
+_gst_get_method_entry (OOP methodOOP, OOP receiverClass)
 {
   if (!IS_OOP_VERIFIED (methodOOP))
     _gst_verify_sent_method (methodOOP);
 
-  return find_method_entry (methodOOP, receiverClass)->nativeCode;
+  return find_method_entry (methodOOP, receiverClass);
 }
 
 method_entry *
@@ -3779,33 +3931,9 @@ find_method_entry (OOP methodOOP, OOP receiverClass)
     }
 
   size = NUM_INDEXABLE_FIELDS (methodOOP);
-  new_method_entry (methodOOP, receiverClass, size);
+  new_method_entry (methodOOP, receiverClass);
   translate_method (methodOOP, receiverClass, size);
   return (finish_method_entry ());
-}
-
-void
-reset_invalidated_inline_caches ()
-{
-  method_entry *method, **hashEntry;
-  inline_cache *ic;
-  jit_insn *lookupIP;
-
-  for (hashEntry = methods_table; hashEntry <= &discarded; hashEntry++)
-    for (method = *hashEntry; method; method = method->next)
-      {
-        ic = method->inlineCaches;
-        if (!ic)
-	  continue;
-
-        do
-	  {
-	    lookupIP = ic->is_super ? do_super_code : do_send_code;
-	    if (ic->cachedIP != lookupIP && !IS_VALID_IP (ic->cachedIP))
-	      ic->cachedIP = lookupIP;
-	  }
-        while ((ic++)->more);
-      }
 }
 
 void
@@ -3835,13 +3963,16 @@ _gst_free_released_native_code (void)
   if (!released)
     return;
 
-  reset_invalidated_inline_caches ();
+  _gst_reset_inline_caches ();
   _gst_validate_method_cache_entries ();
 
   /* now free the list */
   while ((method = released))
     {
       released = released->next;
+#define _jit method->_jit
+      jit_destroy_state ();
+#undef _jit
       xfree (method);
     }
 }

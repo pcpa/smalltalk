@@ -551,7 +551,7 @@ static void stop_execution (void);
 /* Tell the interpreter that special actions are needed as soon as a
    sequence point is reached.  */
 #ifdef ENABLE_JIT_TRANSLATION
-mst_Boolean _gst_except_flag = false;
+int _gst_except_flag = false;
 #define SET_EXCEPT_FLAG(x) \
   do { _gst_except_flag = (x); __sync_synchronize (); } while (0)
 
