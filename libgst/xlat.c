@@ -581,7 +581,7 @@ generate_run_time_code (void)
 #if 0
   init_jit (NULL);
 #else
-  init_jit ("/home/pcpa/gnu/smalltalk/.libs/gst");
+  init_jit ("/home/pcpa/github/smalltalk/.libs/gst");
 #endif
   _jit = global_jit = jit_new_state();
 
@@ -658,6 +658,7 @@ generate_run_time_code (void)
 
 #if 1
   printf ("<main>\n");
+  jit_print ();
   jit_disassemble ();
 #endif
   jit_clear_state ();
@@ -722,6 +723,7 @@ finish_method_entry (void)
   flush_patches ((char *)result->ipMap);
   //
 #if 1
+  jit_print ();
   jit_disassemble ();
 #endif
   //
@@ -2047,7 +2049,7 @@ gen_unary_special (code_tree *tree)
 
       /* Look for too big an integer...  */
       jit_patch (ok2);
-      if (SIZEOF_OOP > 4)
+      if (SIZEOF_OOP > sizeof (long))
 	{
           emit_basic_size_in_r0 (_gst_large_positive_integer_class, false, JIT_R2);
           ok3 = jit_blei_u (JIT_R0, sz);
@@ -2708,6 +2710,9 @@ emit_inlined_primitive (int primitive, int numArgs, int attr)
 
 	if (!shape)
 	  {
+#if 1
+  jit_note (method_name, __LINE__);
+#endif
 	    /* return failure */
 	    jit_movi (JIT_R0, -1);
 	    return PRIM_FAIL | PRIM_INLINED;
@@ -2718,6 +2723,9 @@ emit_inlined_primitive (int primitive, int numArgs, int attr)
 	  /* too complicated to return LargeIntegers */
 	  break;
 
+#if 1
+  jit_note (method_name, __LINE__);
+#endif
 	jit_ldi (JIT_R1, &sp);
 	emit_basic_size_in_r0 (current->receiverClass, false, JIT_NOREG);
 
@@ -2742,11 +2750,17 @@ emit_inlined_primitive (int primitive, int numArgs, int attr)
 	switch (shape)
 	  {
 	  case GST_ISP_POINTER:
+#if 1
+  jit_note (method_name, __LINE__);
+#endif
 	    jit_lshi (JIT_V1, JIT_V1, LONG_SHIFT);
 	    jit_ldxr (JIT_R0, JIT_R2, JIT_V1);
 	    break;
 
 	  case GST_ISP_UCHAR:
+#if 1
+  jit_note (method_name, __LINE__);
+#endif
 	    jit_ldxr_uc (JIT_R0, JIT_R2, JIT_V1);
 
 	    /* Tag the byte we read */
@@ -2755,6 +2769,9 @@ emit_inlined_primitive (int primitive, int numArgs, int attr)
 	    break;
 
 	  case GST_ISP_SCHAR:
+#if 1
+  jit_note (method_name, __LINE__);
+#endif
 	    jit_ldxr_c (JIT_R0, JIT_R2, JIT_V1);
 
 	    /* Tag the byte we read */
@@ -2764,6 +2781,9 @@ emit_inlined_primitive (int primitive, int numArgs, int attr)
 
 	  case GST_ISP_CHARACTER:
 	    {
+#if 1
+  jit_note (method_name, __LINE__);
+#endif
 	      jit_ldxr_uc (JIT_R0, JIT_R2, JIT_V1);
 
               /* Convert to a character */
@@ -2772,6 +2792,9 @@ emit_inlined_primitive (int primitive, int numArgs, int attr)
 	    }
 	  }
 
+#if 1
+  jit_note (method_name, __LINE__);
+#endif
 	/* Store the result and the new stack pointer */
 	jit_str (JIT_R1, JIT_R0);
 	jit_sti (&sp, JIT_R1);
@@ -2784,7 +2807,7 @@ emit_inlined_primitive (int primitive, int numArgs, int attr)
 	/* We get here with the _gst_basic_size in R0 upon failure,
 	   with -1 upon success.  We need to get 0 upon success and -1
 	   upon failure.  */
-	jit_rshi (JIT_R0, JIT_R0, 31);
+	jit_rshi (JIT_R0, JIT_R0, 8 * sizeof (PTR) - 1);
 	jit_comr (JIT_R0, JIT_R0);
 
 	return PRIM_FAIL | PRIM_SUCCEED | PRIM_INLINED;
@@ -2805,6 +2828,9 @@ emit_inlined_primitive (int primitive, int numArgs, int attr)
 
 	if (!shape)
 	  {
+#if 1
+  jit_note (method_name, __LINE__);
+#endif
 	    /* return failure */
 	    jit_movi (JIT_R0, -1);
 	    return PRIM_FAIL | PRIM_INLINED;
@@ -2814,6 +2840,9 @@ emit_inlined_primitive (int primitive, int numArgs, int attr)
 	  /* too complicated to convert LargeIntegers */
 	  break;
 
+#if 1
+  jit_note (method_name, __LINE__);
+#endif
 	jit_ldxi (JIT_V1, JIT_V0, offsetof (struct oop_s, flags));
 	fail0 = jit_bmsi (JIT_V1, (jit_word_t)F_READONLY);
 
@@ -2844,6 +2873,9 @@ emit_inlined_primitive (int primitive, int numArgs, int attr)
 	switch (shape)
 	  {
 	  case GST_ISP_UCHAR:
+#if 1
+  jit_note (method_name, __LINE__);
+#endif
 	    /* Check and untag the byte we store */
 	    fail3 = jit_bmci (JIT_V1, 1);
 	    jit_rshi_u (JIT_R0, JIT_V1, 1);
@@ -2853,6 +2885,9 @@ emit_inlined_primitive (int primitive, int numArgs, int attr)
 	    break;
 
 	  case GST_ISP_CHARACTER:
+#if 1
+  jit_note (method_name, __LINE__);
+#endif
 	    /* Check the character we store */
 	    fail3 = jit_bmsi (JIT_V1, 1);
 
@@ -2864,10 +2899,16 @@ emit_inlined_primitive (int primitive, int numArgs, int attr)
 	    break;
 
 	  case GST_ISP_POINTER:
+#if 1
+  jit_note (method_name, __LINE__);
+#endif
 	    fail3 = fail4 = NULL;
 	    jit_str (JIT_R2, JIT_V1);
 	  }
 
+#if 1
+  jit_note (method_name, __LINE__);
+#endif
 	/* Store the result and the new stack pointer */
 	jit_subi (JIT_R1, JIT_R1, sizeof (PTR) * 2);
 	jit_str (JIT_R1, JIT_V1);
@@ -2887,7 +2928,7 @@ emit_inlined_primitive (int primitive, int numArgs, int attr)
 	/* We get here with the _gst_basic_size in R0 upon failure,
 	   with -1 upon success.  We need to get 0 upon success and -1
 	   upon failure.  */
-	jit_rshi (JIT_R0, JIT_R0, 31);
+	jit_rshi (JIT_R0, JIT_R0, 8 * sizeof (PTR) - 1);
 	jit_comr (JIT_R0, JIT_R0);
 
 	return PRIM_FAIL | PRIM_SUCCEED | PRIM_INLINED;
@@ -2905,6 +2946,9 @@ emit_inlined_primitive (int primitive, int numArgs, int attr)
 	  /* too complicated to convert LargeIntegers */
 	  break;
 
+#if 1
+  jit_note (method_name, __LINE__);
+#endif
         jit_ldi (JIT_R1, &sp);
         emit_basic_size_in_r0 (current->receiverClass, true, JIT_NOREG);
         jit_str (JIT_R1, JIT_R0);
@@ -2924,11 +2968,17 @@ emit_inlined_primitive (int primitive, int numArgs, int attr)
 	class_oop = METACLASS_INSTANCE (current->receiverClass);
 	if (CLASS_IS_INDEXABLE (class_oop))
 	  {
+#if 1
+  jit_note (method_name, __LINE__);
+#endif
 	    /* return failure */
 	    jit_movi (JIT_R0, -1);
 	    return PRIM_FAIL | PRIM_INLINED;
 	  }
 
+#if 1
+  jit_note (method_name, __LINE__);
+#endif
 	/* SET_STACKTOP (alloc_oop (instantiate (_gst_self))) */
 	jit_prepare ();
 	jit_pushargr (JIT_V0);
@@ -2960,11 +3010,17 @@ emit_inlined_primitive (int primitive, int numArgs, int attr)
 	class_oop = METACLASS_INSTANCE (current->receiverClass);
 	if (!CLASS_IS_INDEXABLE (class_oop))
 	  {
+#if 1
+  jit_note (method_name, __LINE__);
+#endif
 	    /* return failure */
 	    jit_movi (JIT_R0, -1);
 	    return PRIM_FAIL | PRIM_INLINED;
 	  }
 
+#if 1
+  jit_note (method_name, __LINE__);
+#endif
 	jit_ldi (JIT_V1, &sp);
 	jit_ldr (JIT_R1, JIT_V1);	/* load the argument */
 	jit_movi (JIT_R0, -1);	/* failure */
@@ -3000,6 +3056,9 @@ emit_inlined_primitive (int primitive, int numArgs, int attr)
       if (numArgs != 1)
 	break;
 
+#if 1
+  jit_note (method_name, __LINE__);
+#endif
       jit_ldi (JIT_V1, &sp);
       jit_ldr (JIT_R1, JIT_V1);	/* load the argument */
       jit_ner (JIT_R0, JIT_R1, JIT_V0);
@@ -3021,6 +3080,9 @@ emit_inlined_primitive (int primitive, int numArgs, int attr)
         if (numArgs != 0)
 	  break;
 
+#if 1
+  jit_note (method_name, __LINE__);
+#endif
         jit_ldi (JIT_V1, &sp);
 	jit_movi (JIT_R0, (jit_word_t)_gst_small_integer_class);
         jmp = jit_bmsi (JIT_V0, 1);
@@ -3052,6 +3114,9 @@ emit_primitive (int primitive, int numArgs)
 
   if (!(attr & PRIM_INLINED))
     {
+#if 1
+  jit_note (method_name, __LINE__);
+#endif
       jit_movi (JIT_R1, numArgs);
       jit_movi (JIT_R2, pte->id);
       jit_prepare ();
@@ -3067,6 +3132,9 @@ emit_primitive (int primitive, int numArgs)
 
   if (attr & PRIM_RELOAD_IP)
     {
+#if 1
+  jit_note (method_name, __LINE__);
+#endif
       succeed = (attr & PRIM_SUCCEED)
 	? jit_beqi (JIT_R0, 0) : NULL;
 
@@ -3081,6 +3149,9 @@ emit_primitive (int primitive, int numArgs)
     }
   if (attr & (PRIM_SUCCEED | PRIM_RELOAD_IP))
     {
+#if 1
+  jit_note (method_name, __LINE__);
+#endif
       if (attr & PRIM_CHECK_INTERRUPT)
 	emit_interrupt_check (JIT_V2, -1);
 
@@ -3280,14 +3351,10 @@ emit_method_prolog (OOP methodOOP,
 	  + (header.primitiveIndex * sizeof (OOP));
 	jit_ldxi (JIT_V1, JIT_V1, offsetof (inline_cache, native_ip));
 
-	/* Reload R2 because after an indirect jump lightning 2
-	 * considers non callee save registers as dead (R2 could
-	 * have been used as a temporary). */
 #if 1
   jit_note ("Remember3", __LINE__);
 #endif
-	jit_ldxi (JIT_R2, JIT_V0, offsetof (struct oop_s, object));
-	jit_ldxi (JIT_R2, JIT_R2, ofs);	/* R2 is _gst_self->object */
+	jit_ldxi (JIT_R2, JIT_R2, ofs);	/* Remember? R2 is _gst_self->object */
 
 	jit_str (JIT_V2, JIT_R2);	/* Make it the stack top */
 	jit_jmpr (JIT_V1);
