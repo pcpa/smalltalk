@@ -3523,7 +3523,6 @@ emit_block_prolog (OOP blockOOP,
   header = block->header;
   receiverClass = current->receiverClass;
 
-#if 0
   /* Check if the number of arguments matches ours */
   jit_ldxi_uc (JIT_R2, JIT_V1, offsetof (inline_cache, numArgs));
   out = jit_beqi (JIT_R2, header.numArgs);
@@ -3536,13 +3535,10 @@ emit_block_prolog (OOP blockOOP,
   jit_ldi (JIT_R2, &native_ip);
   jmp = jit_movi (JIT_R0, 0);
   jit_patch_at (jmp, native_code_label);
-  jmp = jit_beqr (JIT_R2, JIT_R0);
-#endif
+  jmp = jit_bner (JIT_R2, JIT_R0);
   send = jit_forward ();
-#if 0
   jit_patch_at (jmp, send);
   jit_patch (out);
-#endif
 
   /* Check if a block evaluation was indeed requested, and if the
      BlockClosure really points to this CompiledBlock */
