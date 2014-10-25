@@ -147,6 +147,12 @@ typedef struct deferred_send
   struct deferred_send *next;
 }
 deferred_send;
+
+typedef struct native_entry {
+    struct native_entry *next;
+    void *code;
+    method_entry *method;
+} native_entry;
 
 
 /* Lighting */
@@ -166,6 +172,7 @@ static size_t num_buf_patch, size_buf_patch;
 
 /* Here is where the dynamically compiled stuff goes */
 static method_entry *methods_table[HASH_TABLE_SIZE+1], *released;
+static native_entry *native_table[HASH_TABLE_SIZE];
 
 #define discarded methods_table[HASH_TABLE_SIZE]
 
@@ -297,6 +304,9 @@ static inline void finish_deferred_send (void);
 static method_entry *find_method_entry (OOP methodOOP, OOP receiverClass);
 static inline void new_method_entry (OOP methodOOP, OOP receiverClass);
 static inline method_entry *finish_method_entry (void);
+static void add_native_entry (method_entry *entry);
+static method_entry *get_native_entry (void *nativeCode);
+static void rem_native_entry (method_entry *entry);
 
 /* code_tree handling */
 static inline code_tree *push_tree_node (gst_uchar *bp, code_tree *firstChild, int operation, PTR data);
@@ -735,9 +745,61 @@ finish_method_entry (void)
   hashEntry = OOP_INDEX (result->methodOOP) % HASH_TABLE_SIZE;
   result->next = methods_table[hashEntry];
   methods_table[hashEntry] = result;
+  add_native_entry (result);
 
   obstack_free (&aux_data_obstack, NULL);
   return result;
+}
+
+static void
+add_native_entry (method_entry *method)
+{
+  native_entry *native;
+  unsigned int hash;
+
+  assert (method->nativeCode);
+  hash = ((unsigned long)method->nativeCode >> LONG_SHIFT) % HASH_TABLE_SIZE;
+  native = (native_entry *) xmalloc (sizeof (native_entry));
+  native->code = method->nativeCode;
+  native->method = method;
+  native->next = native_table[hash];
+  native_table[hash] = native;
+}
+
+static method_entry *
+get_native_entry (void *code)
+{
+  native_entry *native;
+  unsigned int hash;
+
+  hash = ((unsigned long)code >> LONG_SHIFT) % HASH_TABLE_SIZE;
+  for (native = native_table[hash]; native; native = native->next)
+    {
+      if (native->code == code)
+	break;
+    }
+  return native ? native->method : NULL;
+}
+
+static void
+rem_native_entry (method_entry *method)
+{
+  native_entry *prev, *native;
+  unsigned int hash;
+
+  hash = ((unsigned long)method->nativeCode >> LONG_SHIFT) % HASH_TABLE_SIZE;
+  prev = native = native_table[hash];
+  for (; native; prev = native, native = native->next)
+    {
+      if (native->code == method->nativeCode)
+	break;
+    }
+  assert (native);
+  if (prev == native)
+    native_table[hash] = native->next;
+  else
+    prev->next = native->next;
+  xfree (native);
 }
 
 
@@ -4011,6 +4073,30 @@ find_method_entry (OOP methodOOP, OOP receiverClass)
 }
 
 void
+reset_invalidated_inline_caches ()
+{
+  method_entry *method, **hashEntry;
+  inline_cache *ic;
+  void *lookupIP;
+
+  for (hashEntry = methods_table; hashEntry <= &discarded; hashEntry++)
+    for (method = *hashEntry; method; method = method->next)
+      {
+        ic = method->inlineCaches;
+        if (!ic)
+	  continue;
+
+        do
+	  {
+	    lookupIP = ic->is_super ? do_super_code : do_send_code;
+	    if (ic->cachedIP != lookupIP && !get_native_entry (ic->cachedIP))
+	      ic->cachedIP = lookupIP;
+	  }
+        while ((ic++)->more);
+      }
+}
+
+void
 _gst_reset_inline_caches ()
 {
   method_entry *method, **hashEntry;
@@ -4037,7 +4123,7 @@ _gst_free_released_native_code (void)
   if (!released)
     return;
 
-  _gst_reset_inline_caches ();
+  reset_invalidated_inline_caches ();
   _gst_validate_method_cache_entries ();
 
   /* now free the list */
@@ -4047,6 +4133,7 @@ _gst_free_released_native_code (void)
 #define _jit method->_jit
       jit_destroy_state ();
 #undef _jit
+      method->_jit = NULL;
       xfree (method);
     }
 }
@@ -4074,6 +4161,7 @@ walk_and_remove_method (OOP methodOOP, method_entry **ptrNext)
       if (method->inlineCaches)
 	xfree (method->inlineCaches);
 
+      rem_native_entry (method);
       method->receiverClass = NULL;
       method->inlineCaches = NULL;
     }
