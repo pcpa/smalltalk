@@ -194,6 +194,7 @@ char method_name[64];
 #define	jit_field(struc, f)		( ((long) (&((struc *) 8)->f) ) - 8)
 #define	jit_ptr_field(struc_p, f)	( ((long) (&((struc_p) 8)->f) ) - 8)
 #endif
+#define DISASSEMBLE		0
 
 PTR (*_gst_run_native_code) ();
 PTR (*_gst_return_from_native_code) ();
@@ -451,7 +452,7 @@ generate_bad_return_code (jit_node_t *does_not_understand_label)
   jmp = jit_bmsi (JIT_R1, 1);
   jit_ldxi (JIT_V0, JIT_R1, offsetof (struct oop_s, object));
   jit_ldxi (JIT_V0, JIT_V0, offsetof (struct object_s, objClass));
-#if 1
+#if DISASSEMBLE
   jit_note("badReturn", __LINE__);
 #endif
   jit_patch (jmp);
@@ -467,7 +468,7 @@ generate_bad_return_code (jit_node_t *does_not_understand_label)
   /* Might not be understood... how broken they are :-) */
   jmp = jit_beqi (JIT_R0, 0);
   jit_patch_at (jmp, does_not_understand_label);
-#if 1
+#if DISASSEMBLE
   jit_note("badReturn", __LINE__);
 #endif
   jit_jmpr (JIT_R0);
@@ -509,7 +510,7 @@ generate_do_super_code (jit_node_t *does_not_understand_label)
   jmp = jit_beqi (JIT_R0, 0);
   jit_patch_at (jmp, does_not_understand_label);
   jit_stxi (offsetof (inline_cache, cachedIP), JIT_V1, JIT_R0);
-#if 1
+#if DISASSEMBLE
   jit_note("doSuper", __LINE__);
 #endif
   jit_jmpr (JIT_R0);
@@ -534,7 +535,7 @@ generate_do_send_code (jit_node_t *does_not_understand_label)
   jmp = jit_bmsi (JIT_R1, 1);
   jit_ldxi (JIT_V0, JIT_R1, offsetof (struct oop_s, object));
   jit_ldxi (JIT_V0, JIT_V0, offsetof (struct object_s, objClass));
-#if 1
+#if DISASSEMBLE
   jit_note("doSend", __LINE__);
 #endif
   jit_patch (jmp);
@@ -551,7 +552,7 @@ generate_do_send_code (jit_node_t *does_not_understand_label)
   jmp = jit_beqi (JIT_R0, 0);
   jit_patch_at (jmp, does_not_understand_label);
   jit_stxi (offsetof (inline_cache, cachedIP), JIT_V1, JIT_R0);
-#if 1
+#if DISASSEMBLE
   jit_note("doSend", __LINE__);
 #endif
   jit_jmpr (JIT_R0);
@@ -585,7 +586,7 @@ generate_run_time_code (void)
 #endif
   _jit = global_jit = jit_new_state();
 
-#if 1
+#if DISASSEMBLE
   jit_note("runNative", __LINE__);
 #endif
   jit_prolog ();
@@ -596,7 +597,7 @@ generate_run_time_code (void)
   jit_ldi (JIT_V2, &sp);
   jit_jmpr (JIT_R0);
 
-#if 1
+#if DISASSEMBLE
   jit_note("doesNotUnderstand", __LINE__);
 #endif
   does_not_understand_label = jit_indirect ();
@@ -604,43 +605,43 @@ generate_run_time_code (void)
 
   /* send #badReturnError.  No inline caching must take place because
      this is called upon a return, not upon a send.  */
-#if 1
+#if DISASSEMBLE
   jit_note("badReturn", __LINE__);
 #endif
   bad_return_label = jit_indirect ();
   generate_bad_return_code (does_not_understand_label);
 
-#if 1
+#if DISASSEMBLE
   jit_note("nonBoolean", __LINE__);
 #endif
   non_boolean_label = jit_indirect ();
   generate_non_boolean_code ();
 
-#if 1
+#if DISASSEMBLE
   jit_note("doSuper", __LINE__);
 #endif
   do_super_label = jit_indirect ();
   generate_do_super_code (does_not_understand_label);
 
-#if 1
+#if DISASSEMBLE
   jit_note("doSend", __LINE__);
 #endif
   do_send_label = jit_indirect ();
   generate_do_send_code (does_not_understand_label);
 
-#if 1
+#if DISASSEMBLE
   jit_note("returnZeroFromNative", __LINE__);
 #endif
   return_zero_from_native_label = jit_indirect ();
   jit_movi (JIT_R0, 0);
-#if 1
+#if DISASSEMBLE
   jit_note("returnFromNative", __LINE__);
 #endif
   return_from_native_label = jit_indirect ();
   jit_retr (JIT_R0);
 
   jit_realize ();
-#if 0
+#if !DISASSEMBLE
   jit_set_data (NULL, 0, JIT_DISABLE_DATA|JIT_DISABLE_NOTE);
 #endif
   _gst_run_native_code = jit_emit ();
@@ -656,10 +657,11 @@ generate_run_time_code (void)
   _gst_return_from_native_code = jit_address (return_from_native_label);
   ic.native_ip = jit_address (return_zero_from_native_label);
 
-#if 1
+#if DISASSEMBLE
   printf ("<main>\n");
   jit_print ();
   jit_disassemble ();
+  fflush (stdout);
 #endif
   jit_clear_state ();
 }
@@ -676,7 +678,7 @@ new_method_entry (OOP methodOOP, OOP receiverClass)
   current->inlineCaches = NULL;
   methodOOP->flags |= F_XLAT;
 
-#if 1
+#if DISASSEMBLE
   printf ("<methodOOP: ");
   _gst_print_object (methodOOP);
   printf (">\n<receiverClass: ");
@@ -713,7 +715,7 @@ finish_method_entry (void)
   /* Copy the IP map, adding a final dummy entry */
   define_ip_map_entry (-1);
   jit_realize ();
-#if 0
+#if !DISASSEMBLE
   jit_set_data (NULL, 0, JIT_DISABLE_DATA|JIT_DISABLE_NOTE);
 #endif
   result->nativeCode = jit_emit ();
@@ -722,9 +724,10 @@ finish_method_entry (void)
   _gst_copy_buffer (result->ipMap);
   flush_patches ((char *)result->ipMap);
   //
-#if 1
+#if DISASSEMBLE
   jit_print ();
   jit_disassemble ();
+  fflush (stdout);
 #endif
   //
   jit_clear_state ();
@@ -1439,22 +1442,22 @@ gen_send (code_tree *tree)
 {
   inline_cache *ic = (inline_cache *) tree->data;
 
-#if 1
+#if DISASSEMBLE
       jit_note(method_name, __LINE__);
 #endif
   PUSH_CHILDREN;
-#if 1
+#if DISASSEMBLE
       jit_note(method_name, __LINE__);
 #endif
   jit_movi (JIT_V1, (jit_word_t)ic);
-#if 1
+#if DISASSEMBLE
       jit_note(method_name, __LINE__);
 #endif
   if (ic->is_super)
     KEEP_V0_EXPORT_SP;
   else
     EXPORT_SP (JIT_V0);
-#if 1
+#if DISASSEMBLE
       jit_note(method_name, __LINE__);
 #endif
 
@@ -1462,7 +1465,7 @@ gen_send (code_tree *tree)
   jit_ldxi (JIT_R1, JIT_V1, offsetof (inline_cache, cachedIP));
   jit_sti (&ip, JIT_R0);
 
-#if 1
+#if DISASSEMBLE
       jit_note(method_name, __LINE__);
 #endif
   jit_jmpr (JIT_R1);
@@ -1470,11 +1473,11 @@ gen_send (code_tree *tree)
   defer_map_patch (&ic->native_ip);
   define_ip_map_entry (tree->bp - bc + tree->bc_len);
 
-#if 1
+#if DISASSEMBLE
       jit_note(method_name, __LINE__);
 #endif
   IMPORT_SP;
-#if 1
+#if DISASSEMBLE
       jit_note(method_name, __LINE__);
 #endif
   CACHE_NOTHING;
@@ -1502,7 +1505,7 @@ gen_binary_int (code_tree *tree)
   switch (ic->imm)
     {
     case PLUS_SPECIAL:
-#if 1
+#if DISASSEMBLE
       jit_note(method_name, __LINE__);
 #endif
       if (reg1 == JIT_NOREG)
@@ -1545,7 +1548,7 @@ gen_binary_int (code_tree *tree)
 
 
     case MINUS_SPECIAL:
-#if 1
+#if DISASSEMBLE
       jit_note(method_name, __LINE__);
 #endif
       if (reg1 == JIT_NOREG)
@@ -1593,7 +1596,7 @@ gen_binary_int (code_tree *tree)
 
 
     case TIMES_SPECIAL:
-#if 1
+#if DISASSEMBLE
       jit_note(method_name, __LINE__);
 #endif
 	if (reg1 == JIT_NOREG)
@@ -1704,7 +1707,7 @@ gen_binary_int (code_tree *tree)
 
 
     case INTEGER_DIVIDE_SPECIAL:
-#if 1
+#if DISASSEMBLE
       jit_note(method_name, __LINE__);
 #endif
       if (reg1 == JIT_NOREG)
@@ -1830,7 +1833,7 @@ gen_binary_int (code_tree *tree)
 
     case REMAINDER_SPECIAL:
     case BIT_SHIFT_SPECIAL:
-#if 1
+#if DISASSEMBLE
       jit_note(method_name, __LINE__);
 #endif
       /* not yet */
@@ -1839,20 +1842,20 @@ gen_binary_int (code_tree *tree)
       break;
 
     case BIT_AND_SPECIAL:
-#if 1
+#if DISASSEMBLE
       jit_note(method_name, __LINE__);
 #endif
       CMP_IMM_OR_REG (and, JIT_V0);
       break;
     case BIT_OR_SPECIAL:
-#if 1
+#if DISASSEMBLE
       jit_note(method_name, __LINE__);
 #endif
       CMP_IMM_OR_REG (or, JIT_V0);
       break;
 
     case BIT_XOR_SPECIAL:
-#if 1
+#if DISASSEMBLE
       jit_note(method_name, __LINE__);
 #endif
       /* For XOR, the tag bits of the two operands cancel (unlike
@@ -1870,12 +1873,12 @@ gen_binary_int (code_tree *tree)
 
       break;
     }
-#if 1
+#if DISASSEMBLE
       jit_note(method_name, __LINE__);
 #endif
 
   EXPORT_SP (JIT_V0);
-#if 1
+#if DISASSEMBLE
       jit_note(method_name, __LINE__);
 #endif
   if (overflow)
@@ -2444,14 +2447,14 @@ emit_code_tree (code_tree *tree)
       break;
 
     case TREE_EXTRA_POP:
-#if 1
+#if DISASSEMBLE
       jit_note(method_name, __LINE__);
 #endif
       POP_EXPORT_SP;
       break;
 
     case TREE_EXTRA_RETURN:
-#if 1
+#if DISASSEMBLE
       jit_note(method_name, __LINE__);
 #endif
       CACHE_STACK_TOP;
@@ -2463,7 +2466,7 @@ emit_code_tree (code_tree *tree)
       break;
 
     case TREE_EXTRA_METHOD_RET:
-#if 1
+#if DISASSEMBLE
       jit_note(method_name, __LINE__);
 #endif
       CACHE_STACK_TOP;
@@ -2479,7 +2482,7 @@ emit_code_tree (code_tree *tree)
       break;
 
     case TREE_EXTRA_JMP_ALWAYS:
-#if 1
+#if DISASSEMBLE
       jit_note(method_name, __LINE__);
 #endif
       CACHE_STACK_TOP;
@@ -2488,21 +2491,21 @@ emit_code_tree (code_tree *tree)
       break;
 
     case TREE_EXTRA_JMP_TRUE:
-#if 1
+#if DISASSEMBLE
       jit_note(method_name, __LINE__);
 #endif
       CONDITIONAL_JUMP (_gst_true_oop, _gst_false_oop);
       break;
 
     case TREE_EXTRA_JMP_FALSE:
-#if 1
+#if DISASSEMBLE
       jit_note(method_name, __LINE__);
 #endif
       CONDITIONAL_JUMP (_gst_false_oop, _gst_true_oop);
       break;
     }
 
-#if 1
+#if DISASSEMBLE
       jit_note(method_name, __LINE__);
 #endif
   /* Change the code_tree's operation field to TREE_ALREADY_EMITTED,
@@ -2531,7 +2534,7 @@ emit_deferred_sends (deferred_send *ds)
   ic = (inline_cache *) tree->data;
   assert (!ic->is_super);
 
-#if 1
+#if DISASSEMBLE
       jit_note(method_name, __LINE__);
 #endif
   jit_link (ds->address);
@@ -2541,14 +2544,14 @@ emit_deferred_sends (deferred_send *ds)
       ds->reg1 = JIT_R0;
     }
 
-#if 1
+#if DISASSEMBLE
       jit_note(method_name, __LINE__);
 #endif
   jit_stxi (sizeof (PTR) * 1, JIT_V2, ds->reg0);
   jit_stxi (sizeof (PTR) * 2, JIT_V2, ds->reg1);
   jit_addi (JIT_V2, JIT_V2, sizeof (PTR) * 2);
 
-#if 1
+#if DISASSEMBLE
       jit_note(method_name, __LINE__);
 #endif
   jit_movi (JIT_V1, (jit_word_t)ic);
@@ -2557,7 +2560,7 @@ emit_deferred_sends (deferred_send *ds)
   jit_ldxi (JIT_R1, JIT_V1, offsetof (inline_cache, cachedIP));
   jit_sti (&ip, JIT_V0);
 
-#if 1
+#if DISASSEMBLE
       jit_note(method_name, __LINE__);
 #endif
   jit_jmpr (JIT_R1);
@@ -2565,7 +2568,7 @@ emit_deferred_sends (deferred_send *ds)
   defer_map_patch (&ic->native_ip);
   define_ip_map_entry (tree->bp - bc);
 
-#if 1
+#if DISASSEMBLE
       jit_note(method_name, __LINE__);
 #endif
   IMPORT_SP;
@@ -2598,7 +2601,7 @@ emit_interrupt_check (int restartReg, int ipOffset)
 {
   jit_node_t *jmp, *restart = NULL;
 
-#if 1
+#if DISASSEMBLE
       jit_note(method_name, __LINE__);
 #endif
   jit_ldi_i (JIT_R2, &_gst_except_flag);
@@ -2617,7 +2620,7 @@ emit_interrupt_check (int restartReg, int ipOffset)
   else
       jit_movr (JIT_R0, restartReg);
 
-#if 1
+#if DISASSEMBLE
       jit_note(method_name, __LINE__);
 #endif
   jit_patch_abs (jit_jmpi (), _gst_return_from_native_code);
@@ -2710,7 +2713,7 @@ emit_inlined_primitive (int primitive, int numArgs, int attr)
 
 	if (!shape)
 	  {
-#if 1
+#if DISASSEMBLE
   jit_note (method_name, __LINE__);
 #endif
 	    /* return failure */
@@ -2723,7 +2726,7 @@ emit_inlined_primitive (int primitive, int numArgs, int attr)
 	  /* too complicated to return LargeIntegers */
 	  break;
 
-#if 1
+#if DISASSEMBLE
   jit_note (method_name, __LINE__);
 #endif
 	jit_ldi (JIT_R1, &sp);
@@ -2750,7 +2753,7 @@ emit_inlined_primitive (int primitive, int numArgs, int attr)
 	switch (shape)
 	  {
 	  case GST_ISP_POINTER:
-#if 1
+#if DISASSEMBLE
   jit_note (method_name, __LINE__);
 #endif
 	    jit_lshi (JIT_V1, JIT_V1, LONG_SHIFT);
@@ -2758,7 +2761,7 @@ emit_inlined_primitive (int primitive, int numArgs, int attr)
 	    break;
 
 	  case GST_ISP_UCHAR:
-#if 1
+#if DISASSEMBLE
   jit_note (method_name, __LINE__);
 #endif
 	    jit_ldxr_uc (JIT_R0, JIT_R2, JIT_V1);
@@ -2769,7 +2772,7 @@ emit_inlined_primitive (int primitive, int numArgs, int attr)
 	    break;
 
 	  case GST_ISP_SCHAR:
-#if 1
+#if DISASSEMBLE
   jit_note (method_name, __LINE__);
 #endif
 	    jit_ldxr_c (JIT_R0, JIT_R2, JIT_V1);
@@ -2781,7 +2784,7 @@ emit_inlined_primitive (int primitive, int numArgs, int attr)
 
 	  case GST_ISP_CHARACTER:
 	    {
-#if 1
+#if DISASSEMBLE
   jit_note (method_name, __LINE__);
 #endif
 	      jit_ldxr_uc (JIT_R0, JIT_R2, JIT_V1);
@@ -2792,7 +2795,7 @@ emit_inlined_primitive (int primitive, int numArgs, int attr)
 	    }
 	  }
 
-#if 1
+#if DISASSEMBLE
   jit_note (method_name, __LINE__);
 #endif
 	/* Store the result and the new stack pointer */
@@ -2828,7 +2831,7 @@ emit_inlined_primitive (int primitive, int numArgs, int attr)
 
 	if (!shape)
 	  {
-#if 1
+#if DISASSEMBLE
   jit_note (method_name, __LINE__);
 #endif
 	    /* return failure */
@@ -2840,7 +2843,7 @@ emit_inlined_primitive (int primitive, int numArgs, int attr)
 	  /* too complicated to convert LargeIntegers */
 	  break;
 
-#if 1
+#if DISASSEMBLE
   jit_note (method_name, __LINE__);
 #endif
 	jit_ldxi (JIT_V1, JIT_V0, offsetof (struct oop_s, flags));
@@ -2873,7 +2876,7 @@ emit_inlined_primitive (int primitive, int numArgs, int attr)
 	switch (shape)
 	  {
 	  case GST_ISP_UCHAR:
-#if 1
+#if DISASSEMBLE
   jit_note (method_name, __LINE__);
 #endif
 	    /* Check and untag the byte we store */
@@ -2885,7 +2888,7 @@ emit_inlined_primitive (int primitive, int numArgs, int attr)
 	    break;
 
 	  case GST_ISP_CHARACTER:
-#if 1
+#if DISASSEMBLE
   jit_note (method_name, __LINE__);
 #endif
 	    /* Check the character we store */
@@ -2899,14 +2902,14 @@ emit_inlined_primitive (int primitive, int numArgs, int attr)
 	    break;
 
 	  case GST_ISP_POINTER:
-#if 1
+#if DISASSEMBLE
   jit_note (method_name, __LINE__);
 #endif
 	    fail3 = fail4 = NULL;
 	    jit_str (JIT_R2, JIT_V1);
 	  }
 
-#if 1
+#if DISASSEMBLE
   jit_note (method_name, __LINE__);
 #endif
 	/* Store the result and the new stack pointer */
@@ -2946,7 +2949,7 @@ emit_inlined_primitive (int primitive, int numArgs, int attr)
 	  /* too complicated to convert LargeIntegers */
 	  break;
 
-#if 1
+#if DISASSEMBLE
   jit_note (method_name, __LINE__);
 #endif
         jit_ldi (JIT_R1, &sp);
@@ -2968,7 +2971,7 @@ emit_inlined_primitive (int primitive, int numArgs, int attr)
 	class_oop = METACLASS_INSTANCE (current->receiverClass);
 	if (CLASS_IS_INDEXABLE (class_oop))
 	  {
-#if 1
+#if DISASSEMBLE
   jit_note (method_name, __LINE__);
 #endif
 	    /* return failure */
@@ -2976,7 +2979,7 @@ emit_inlined_primitive (int primitive, int numArgs, int attr)
 	    return PRIM_FAIL | PRIM_INLINED;
 	  }
 
-#if 1
+#if DISASSEMBLE
   jit_note (method_name, __LINE__);
 #endif
 	/* SET_STACKTOP (alloc_oop (instantiate (_gst_self))) */
@@ -3010,7 +3013,7 @@ emit_inlined_primitive (int primitive, int numArgs, int attr)
 	class_oop = METACLASS_INSTANCE (current->receiverClass);
 	if (!CLASS_IS_INDEXABLE (class_oop))
 	  {
-#if 1
+#if DISASSEMBLE
   jit_note (method_name, __LINE__);
 #endif
 	    /* return failure */
@@ -3018,7 +3021,7 @@ emit_inlined_primitive (int primitive, int numArgs, int attr)
 	    return PRIM_FAIL | PRIM_INLINED;
 	  }
 
-#if 1
+#if DISASSEMBLE
   jit_note (method_name, __LINE__);
 #endif
 	jit_ldi (JIT_V1, &sp);
@@ -3056,7 +3059,7 @@ emit_inlined_primitive (int primitive, int numArgs, int attr)
       if (numArgs != 1)
 	break;
 
-#if 1
+#if DISASSEMBLE
   jit_note (method_name, __LINE__);
 #endif
       jit_ldi (JIT_V1, &sp);
@@ -3080,7 +3083,7 @@ emit_inlined_primitive (int primitive, int numArgs, int attr)
         if (numArgs != 0)
 	  break;
 
-#if 1
+#if DISASSEMBLE
   jit_note (method_name, __LINE__);
 #endif
         jit_ldi (JIT_V1, &sp);
@@ -3114,7 +3117,7 @@ emit_primitive (int primitive, int numArgs)
 
   if (!(attr & PRIM_INLINED))
     {
-#if 1
+#if DISASSEMBLE
   jit_note (method_name, __LINE__);
 #endif
       jit_movi (JIT_R1, numArgs);
@@ -3132,7 +3135,7 @@ emit_primitive (int primitive, int numArgs)
 
   if (attr & PRIM_RELOAD_IP)
     {
-#if 1
+#if DISASSEMBLE
   jit_note (method_name, __LINE__);
 #endif
       succeed = (attr & PRIM_SUCCEED)
@@ -3149,7 +3152,7 @@ emit_primitive (int primitive, int numArgs)
     }
   if (attr & (PRIM_SUCCEED | PRIM_RELOAD_IP))
     {
-#if 1
+#if DISASSEMBLE
   jit_note (method_name, __LINE__);
 #endif
       if (attr & PRIM_CHECK_INTERRUPT)
@@ -3303,7 +3306,7 @@ emit_method_prolog (OOP methodOOP,
   flag = header.headerFlag;
   receiverClass = current->receiverClass;
 
-#if 1
+#if DISASSEMBLE
   jit_note (method_name, __LINE__);
 #endif
   if (flag == MTH_USER_DEFINED)
@@ -3338,7 +3341,7 @@ emit_method_prolog (OOP methodOOP,
   switch (flag)
     {
     case MTH_RETURN_SELF:
-#if 1
+#if DISASSEMBLE
   jit_note (method_name, __LINE__);
 #endif
       jit_ldxi (JIT_V1, JIT_V1, offsetof (inline_cache, native_ip));
@@ -3351,7 +3354,7 @@ emit_method_prolog (OOP methodOOP,
 	  + (header.primitiveIndex * sizeof (OOP));
 	jit_ldxi (JIT_V1, JIT_V1, offsetof (inline_cache, native_ip));
 
-#if 1
+#if DISASSEMBLE
   jit_note ("Remember3", __LINE__);
 #endif
 	jit_ldxi (JIT_R2, JIT_R2, ofs);	/* Remember? R2 is _gst_self->object */
@@ -3364,7 +3367,7 @@ emit_method_prolog (OOP methodOOP,
     case MTH_RETURN_LITERAL:
       {
 	OOP literal = OOP_TO_OBJ (method->literals)->data[header.primitiveIndex];
-#if 1
+#if DISASSEMBLE
   jit_note (method_name, __LINE__);
 #endif
 	jit_ldxi (JIT_V1, JIT_V1, offsetof (inline_cache, native_ip));
@@ -3378,7 +3381,7 @@ emit_method_prolog (OOP methodOOP,
       break;
     }
 
-#if 1
+#if DISASSEMBLE
   jit_note (method_name, __LINE__);
 #endif
   jit_ldxi (JIT_V2, JIT_V1, offsetof (inline_cache, native_ip));
@@ -3388,7 +3391,7 @@ emit_method_prolog (OOP methodOOP,
       return (true);
 
   /* Save the return IP */
-#if 1
+#if DISASSEMBLE
   jit_note (method_name, __LINE__);
 #endif
   jit_ldi (JIT_R0, &_gst_this_context_oop);
@@ -3398,7 +3401,7 @@ emit_method_prolog (OOP methodOOP,
 	    JIT_V2);
 
   /* Prepare new state */
-#if 1
+#if DISASSEMBLE
   jit_note (method_name, __LINE__);
 #endif
   jit_movi (JIT_R0, stack_depth);
@@ -3410,13 +3413,13 @@ emit_method_prolog (OOP methodOOP,
   jit_retval (JIT_R0);
 
   /* Remember? V0 was loaded with _gst_self for the inline cache test */
-#if 1
+#if DISASSEMBLE
   jit_note ("Remember0", __LINE__);
 #endif
   jit_sti (&_gst_self, JIT_V0);
 
   /* Set the new context's flags, and _gst_this_method */
-#if 1
+#if DISASSEMBLE
   jit_note (method_name, __LINE__);
 #endif
   jit_movi (JIT_V0, (jit_word_t)current->methodOOP);
@@ -3426,7 +3429,7 @@ emit_method_prolog (OOP methodOOP,
 	    JIT_V1);
 
   /* Move the arguments and nil the temporaries */
-#if 1
+#if DISASSEMBLE
   jit_note (method_name, __LINE__);
 #endif
   emit_context_setup (header.numArgs, header.numTemps);
@@ -3543,7 +3546,7 @@ emit_block_prolog (OOP blockOOP,
      Also initialize _gst_this_method and the pointer to the
      outerContext.  */
   jit_movi (JIT_R1, (jit_word_t)current->methodOOP);
-#if 1
+#if DISASSEMBLE
   jit_note("Remember1", __LINE__);
 #endif
   jit_sti (&_gst_self, JIT_V0);
