@@ -73,11 +73,14 @@ typedef struct method_entry
 }
 method_entry;
 
+extern method_entry *get_native_entry (void *nativeCode)
+  ATTRIBUTE_HIDDEN;
+
 extern void _gst_reset_inline_caches ()
   ATTRIBUTE_HIDDEN;
 
-extern PTR _gst_get_method_entry (OOP methodOOP,
-				  OOP receiverClass) 
+extern PTR _gst_get_native_code (OOP methodOOP,
+				 OOP receiverClass) 
   ATTRIBUTE_HIDDEN;
 
 extern PTR _gst_map_virtual_ip (OOP methodOOP,

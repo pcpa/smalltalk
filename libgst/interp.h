@@ -134,7 +134,7 @@ typedef struct method_cache_entry
   method_header methodHeader;
 #ifdef ENABLE_JIT_TRANSLATION
   OOP receiverClass;
-  PTR methodEntry;
+  PTR nativeCode;
   PTR dummy;                    /* 32 bytes are usually a sweet spot */
 #endif
 } method_cache_entry;

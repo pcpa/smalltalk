@@ -305,7 +305,6 @@ static method_entry *find_method_entry (OOP methodOOP, OOP receiverClass);
 static inline void new_method_entry (OOP methodOOP, OOP receiverClass);
 static inline method_entry *finish_method_entry (void);
 static void add_native_entry (method_entry *entry);
-static method_entry *get_native_entry (void *nativeCode);
 static void rem_native_entry (method_entry *entry);
 
 /* code_tree handling */
@@ -766,7 +765,7 @@ add_native_entry (method_entry *method)
   native_table[hash] = native;
 }
 
-static method_entry *
+method_entry *
 get_native_entry (void *code)
 {
   native_entry *native;
@@ -4024,12 +4023,12 @@ _gst_map_virtual_ip (OOP methodOOP, OOP receiverClass, int ip)
 }
 
 PTR
-_gst_get_method_entry (OOP methodOOP, OOP receiverClass)
+_gst_get_native_code (OOP methodOOP, OOP receiverClass)
 {
   if (!IS_OOP_VERIFIED (methodOOP))
     _gst_verify_sent_method (methodOOP);
 
-  return find_method_entry (methodOOP, receiverClass);
+  return find_method_entry (methodOOP, receiverClass)->nativeCode;
 }
 
 method_entry *
