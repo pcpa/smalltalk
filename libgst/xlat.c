@@ -1771,6 +1771,13 @@ gen_binary_int (code_tree *tree)
 #if DISASSEMBLE
       jit_note(method_name, __LINE__);
 #endif
+#if __WORDSIZE == 64
+	if (overflow) {
+	    jmp = jit_jmpi ();
+	    jit_patch_at (jmp, overflow);
+	    break;
+	}
+#endif
       if (reg1 == JIT_NOREG)
 	{
 	  int shift;
