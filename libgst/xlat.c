@@ -1660,6 +1660,13 @@ gen_binary_int (code_tree *tree)
 #if DISASSEMBLE
       jit_note(method_name, __LINE__);
 #endif
+#if __WORDSIZE == 64
+      if (reg1 == JIT_NOREG)
+	{
+	   reg1 = JIT_R2;
+	   jit_movi (JIT_R2, imm);
+	}
+#else
 	if (reg1 == JIT_NOREG)
 	{
 	  jit_node_t *addr1, *addr2;
@@ -1738,6 +1745,7 @@ gen_binary_int (code_tree *tree)
 
 	}
       else
+#endif
 	{
 	  jit_rshi (JIT_R1, reg0, 1);
 	  jit_rshi (JIT_R0, reg1, 1);
@@ -1772,12 +1780,12 @@ gen_binary_int (code_tree *tree)
       jit_note(method_name, __LINE__);
 #endif
 #if __WORDSIZE == 64
-	if (overflow) {
-	    jmp = jit_jmpi ();
-	    jit_patch_at (jmp, overflow);
-	    break;
+      if (reg1 == JIT_NOREG)
+	{
+	   reg1 = JIT_R2;
+	   jit_movi (JIT_R2, imm);
 	}
-#endif
+#else
       if (reg1 == JIT_NOREG)
 	{
 	  int shift;
@@ -1859,6 +1867,7 @@ gen_binary_int (code_tree *tree)
 
 	}
       else
+#endif
 	{
 	  if (overflow)
 	    {
